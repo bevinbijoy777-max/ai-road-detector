@@ -14,10 +14,8 @@ from airoad.store import (
     create_store,
 )
 
-
-@pytest.fixture
-def database_url(tmp_path):
-    return f"sqlite:///{tmp_path / 'reports.db'}"
+# The ``database_url`` fixture lives in tests/conftest.py: a SQLite file by
+# default, or TEST_DATABASE_URL when the run is pointed at a real Postgres.
 
 
 def test_reports_survive_a_new_store_instance(database_url):

@@ -42,9 +42,8 @@ def make_request(headers=None, client=("1.2.3.4", 1234)) -> Request:
     )
 
 
-@pytest.fixture
-def database_url(tmp_path):
-    return f"sqlite:///{tmp_path / 'rate.db'}"
+# The ``database_url`` fixture lives in tests/conftest.py: a SQLite file by
+# default, or TEST_DATABASE_URL when the run is pointed at a real Postgres.
 
 
 def build_limiter(database_url, limit=3, window_seconds=60, clock=None) -> SqlRateLimiter:

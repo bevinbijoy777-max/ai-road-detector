@@ -20,13 +20,13 @@ client = TestClient(app)
 
 
 @pytest.fixture(autouse=True)
-def configured(monkeypatch, tmp_path):
-    """A configured token, a throwaway database and a roomy limit per test."""
+def configured(monkeypatch, database_url):
+    """A configured token, a clean database and a roomy limit per test."""
     monkeypatch.setenv(SYNC_TOKEN_ENV, SYNC_TOKEN)
-    store = create_store(f"sqlite:///{tmp_path / 'reports.db'}")
+    store = create_store(database_url)
     app.dependency_overrides[store_dependency] = lambda: store
     app.dependency_overrides[limiter_dependency] = lambda: create_limiter(
-        "1000/minute", f"sqlite:///{tmp_path / 'detect-rate.db'}"
+        "1000/minute", database_url
     )
     yield store
     app.dependency_overrides.clear()
@@ -237,11 +237,11 @@ def test_reports_require_a_report_id():
     assert response.status_code == 422
 
 
-def test_reports_reach_a_fresh_store(tmp_path):
+def test_reports_reach_a_fresh_store(database_url):
     """A second process reading the same database still sees the reports."""
     client.post("/reports", json=[{"report_id": "durable"}], headers=AUTH)
 
-    other_instance = create_store(f"sqlite:///{tmp_path / 'reports.db'}")
+    other_instance = create_store(database_url)
     assert other_instance.count() == 1
     assert other_instance.list_reports()[0]["report_id"] == "durable"
 
@@ -281,9 +281,9 @@ def test_reports_return_503_when_storage_is_not_configured(monkeypatch):
 
 
 @pytest.fixture
-def strict_limiter(tmp_path):
+def strict_limiter(database_url):
     """Allow two detect calls per window, shared through a database."""
-    limiter = create_limiter("2/minute", f"sqlite:///{tmp_path / 'strict-rate.db'}")
+    limiter = create_limiter("2/minute", database_url)
     app.dependency_overrides[limiter_dependency] = lambda: limiter
     return limiter
 

@@ -285,7 +285,38 @@ python -m pytest -q
 (including survival across a fresh store instance and duplicate suppression), upload limits,
 the FastAPI endpoints and the CLI.
 
-`.github/workflows/python-tests.yml` runs the suite on Python 3.10 and 3.12 for every push to `main` and every pull request, then smoke-tests the API and CLI imports.
+`.github/workflows/python-tests.yml` runs the suite on Python 3.10 and 3.12 for every push to `main` and every pull request, then smoke-tests the API and CLI imports. A second job runs the whole suite again against a `postgres:16-alpine` service container.
+
+### Verifying against Postgres
+
+The report store, the rate limiter and the API tests run on SQLite by default. Point
+`TEST_DATABASE_URL` at a real Postgres and the *same* assertions run there instead:
+
+```bash
+docker run --rm -d --name airoad-pg \
+  -e POSTGRES_PASSWORD=airoad -e POSTGRES_DB=airoad_test \
+  -p 55432:5432 postgres:16-alpine
+
+TEST_DATABASE_URL="postgresql+psycopg://postgres:airoad@127.0.0.1:55432/airoad_test" \
+  python -m pytest -q
+
+docker rm -f airoad-pg
+```
+
+Or against a hosted scratch database (Neon, Supabase, Vercel Postgres — a direct
+connection string is fine here, no pooler needed):
+
+```bash
+TEST_DATABASE_URL="postgresql+psycopg://user:password@host:5432/dbname" python -m pytest -q
+```
+
+The run prints `database backend: postgres (host:port/dbname)` so you can confirm what
+was actually exercised; without the variable it prints `sqlite`.
+
+**Use a scratch database.** The fixture creates `reports` and `detect_attempts` if they
+are missing and **deletes every row from both before each test**. It deliberately does
+not fall back to `DATABASE_URL`, so a normal test run can never touch your deployment's
+database by accident.
 
 ## Planned Android app
 
