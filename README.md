@@ -2,74 +2,131 @@
 
 Modern smart-city Android app that finds **potholes** and **road cracks**. Detection runs **on the device** (offline). Saved reports sync later when the phone is online. The GPS map uses **Google Maps satellite** imagery.
 
-Python OOP code in `python/` is the same domain model: detector, reports, offline store, and cloud sync.
+The Python OOP core in `python/` is the same domain model: detector, reports and the sync API phones upload to.
 
-## Screens
+## Status
 
-1. **Home / Scan Road** — Take Photo, Upload Image, Live Detection  
-2. **AI Detection Results** — road image, defect labels, confidence %, GPS  
-3. **Road Damage History** — saved reports and sync status  
-4. **GPS Map** — satellite view with green defect markers  
+| Piece | State |
+| --- | --- |
+| `python/airoad` domain models, detectors, CLI, FastAPI sync API | Implemented, tested |
+| Tests + CI (`.github/workflows/python-tests.yml`) | Implemented, runs on push/PR |
+| Android app (`android/`) — screens, `OnDeviceDetector`, Room store, `ReportSyncWorker`, Maps view | **Not in this repository yet** |
 
-Theme: dark navy background, green accents, white text. App icon is a road + location pin (`android/app/src/main/res/drawable/ic_logo.xml`).
+The Python half below is deployable today. The Android half is described under [Planned Android app](#planned-android-app) so the roadmap stays in one place.
+
+## Screens (planned Android app)
+
+1. **Home / Scan Road** — Take Photo, Upload Image, Live Detection
+2. **AI Detection Results** — road image, defect labels, confidence %, GPS
+3. **Road Damage History** — saved reports and sync status
+4. **GPS Map** — satellite view with green defect markers
+
+Theme: dark navy background, green accents, white text.
 
 ## Offline AI
 
 - Inference never needs the internet.
-- Android: `OnDeviceDetector` (lightweight, CPU-friendly; swap in a quantized TFLite model later).
-- Python: `HeuristicDetector` / `OfflineDetectorFacade` — same idea, OOP (`BaseDetector` subclass).
-- Reports are stored locally (`Room` on Android, JSON store in Python) with `synced = false`.
-- `ReportSyncWorker` (WorkManager) and `CloudSyncService` upload pending reports when connectivity returns.
+- Python: `HeuristicDetector` / `OfflineDetectorFacade` — a light, CPU-friendly model (`BaseDetector` subclass). `TFLiteDetector` is a documented placeholder for a quantized TFLite model.
+- Reports carry `synced = false` until the sync API accepts them.
 
-## Google Maps satellite view
+## Python setup
 
-1. Create a key in [Google Cloud Console](https://console.cloud.google.com/) with **Maps SDK for Android** enabled.  
-2. Copy `android/local.properties.example` to `android/local.properties`.  
-3. Set `sdk.dir` and `MAPS_API_KEY`.  
-4. `MapFragment` sets `googleMap.mapType = GoogleMap.MAP_TYPE_SATELLITE`.
+Run from the repository root. `requirements.txt` lives at the root, not in `python/`.
 
-## Android (Android Studio)
+```bash
+python -m venv .venv
 
-1. Open the `android/` folder.  
-2. Let Gradle sync, then run on a device or emulator (Google Play image for Maps).  
-3. Grant camera and location when asked.
+# macOS / Linux
+source .venv/bin/activate
+# Windows
+.venv\Scripts\activate
 
-## Python OOP backend / CLI
+pip install -r requirements.txt
+```
+
+### CLI — offline detection
+
+From the repository root:
+
+```bash
+PYTHONPATH=python python -m airoad path/to/road.jpg --lat 12.9716 --lng 77.5946
+```
+
+```powershell
+# Windows PowerShell
+$env:PYTHONPATH="python"
+python -m airoad path\to\road.jpg --lat 12.9716 --lng 77.5946
+```
+
+Add `--json` for machine-readable output. Exit codes: `0` success, `2` missing/unreadable image or invalid coordinates.
+
+Sample output:
+
+```
+Image:    path/to/road.jpg
+Model:    on-device-heuristic-v1 (offline: yes)
+Location: 12.971600,77.594600
+Primary:  Pothole (100%)
+  - Pothole: 100%
+  - Road Crack: 24%
+```
+
+### Sync API
 
 ```bash
 cd python
-python -m venv .venv
-.venv\Scripts\activate
-pip install -r requirements.txt
-
-# Offline detect (no internet)
-set PYTHONPATH=.
-python -m airoad path\to\road.jpg --lat 12.9716 --lng 77.5946
-
-# Sync API (run when you want the phone to upload)
-uvicorn airoad.api:app --host 0.0.0.0 --port 8000
+PYTHONPATH=. uvicorn airoad.api:app --host 0.0.0.0 --port 8000
 ```
 
-OOP layout:
+| Endpoint | Purpose |
+| --- | --- |
+| `GET /health` | Liveness probe; reports the active model name |
+| `POST /detect` | Multipart `image` file plus optional `latitude`/`longitude` form fields → detection result JSON |
+| `POST /reports` | Accepts the JSON array of reports the phone queued offline; returns how many were accepted |
+
+Interactive docs are served at `http://localhost:8000/docs`.
+
+`POST /reports` only keeps an in-memory acknowledgement log — swap it for a database before using this anywhere that must survive a restart.
+
+Point the Android worker URL (`ReportSyncWorker.DEFAULT_URL`) at your PC's LAN IP if you run this server.
+
+## Deploying the API
+
+The app is a standard ASGI application, so any host that runs `uvicorn` works:
+
+```bash
+pip install -r requirements.txt
+uvicorn airoad.api:app --host 0.0.0.0 --port ${PORT:-8000}
+```
+
+Run it from the `python/` directory, or set `PYTHONPATH=python` from the root.
+
+## OOP layout
 
 | Class | Role |
 | --- | --- |
-| `DefectType`, `GeoLocation`, `DefectPrediction`, `DetectionResult`, `DamageReport` | Domain models |
+| `DefectType`, `GeoLocation`, `DefectPrediction`, `DetectionResult`, `DamageReport` | Domain models (`airoad/models.py`) |
 | `BaseDetector` | Abstract detector |
-| `HeuristicDetector`, `TFLiteDetector` | On-device implementations |
+| `HeuristicDetector`, `TFLiteDetector` | On-device implementations (`airoad/detector.py`) |
 | `OfflineDetectorFacade` | Chooses a local model |
-| `OfflineReportStore` | Local persistence |
-| `SyncQueue`, `CloudSyncService` | Later sync |
 
-Point the Android worker URL (`ReportSyncWorker.DEFAULT_URL`) at your PC’s LAN IP if you run the FastAPI server.
-
-## GitHub
+## Tests and CI
 
 ```bash
-cd C:\Users\USER\ai-road-detector
-git add .
-git commit -m "Initial AI Road Detector app with offline on-device detection"
-gh repo create ai-road-detector --private --source=. --remote=origin --push
+pip install -r requirements-dev.txt
+python -m pytest -q
 ```
 
-CI: `.github/workflows/python-tests.yml` runs the model unit tests on push.
+`conftest.py` puts `python/` on `sys.path`, so tests run from the repository root without installing the package. Coverage: domain models, detector behaviour (including failure modes), the FastAPI endpoints and the CLI.
+
+`.github/workflows/python-tests.yml` runs the suite on Python 3.10 and 3.12 for every push to `main` and every pull request, then smoke-tests the API and CLI imports.
+
+## Planned Android app
+
+Not yet committed. When added, it belongs in `android/` and needs:
+
+1. Create a key in [Google Cloud Console](https://console.cloud.google.com/) with **Maps SDK for Android** enabled.
+2. Copy `android/local.properties.example` to `android/local.properties` (gitignored).
+3. Set `sdk.dir` and `MAPS_API_KEY`.
+4. `MapFragment` sets `googleMap.mapType = GoogleMap.MAP_TYPE_SATELLITE`.
+5. Open `android/` in Android Studio, let Gradle sync, run on a device or emulator (Google Play image for Maps), and grant camera and location when asked.

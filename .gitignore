@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Secret / machine-local config
+.env
+android/local.properties
+
+# Android / Gradle
+android/.gradle/
+android/build/
+android/app/build/
+android/.idea/
+*.apk
+*.aab
+*.iml
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/

@@ -98,5 +98,10 @@ class OfflineDetectorFacade:
     def __init__(self, preferred: Optional[BaseDetector] = None) -> None:
         self._detector = preferred or HeuristicDetector()
 
+    @property
+    def model_name(self) -> str:
+        """Name of the model this facade will use, without running it."""
+        return self._detector.model_name
+
     def run(self, image_path: str, location: Optional[GeoLocation] = None) -> DetectionResult:
         return self._detector.detect(image_path, location)
