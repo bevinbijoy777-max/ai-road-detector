@@ -9,7 +9,8 @@ Two jobs:
   :mod:`airoad.store`, so they survive the instance that handled the upload.
 
 Both ``/reports`` routes require a bearer token (:mod:`airoad.auth`), because the
-stored reports contain GPS coordinates. Detection and health checks stay public.
+stored reports contain GPS coordinates. Detection stays public but is rate limited
+per client (:mod:`airoad.ratelimit`), since every call spends CPU.
 
 Run it locally:
 
@@ -21,18 +22,34 @@ sync reports later.
 
 from __future__ import annotations
 
+import math
 import os
 import tempfile
 from pathlib import Path
 from typing import List, Optional
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile
+from fastapi import (
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+)
 from pydantic import BaseModel, Field
 
 from airoad.auth import require_sync_token
 from airoad.detector import OfflineDetectorFacade
 from airoad.limits import MAX_UPLOAD_BYTES, MAX_UPLOAD_MB, format_size
 from airoad.models import GeoLocation
+from airoad.ratelimit import (
+    RateLimitMisconfigured,
+    RateLimiter,
+    client_key,
+    get_limiter,
+)
 from airoad.store import ReportStore, StorageNotConfigured, get_store
 
 app = FastAPI(
@@ -40,7 +57,8 @@ app = FastAPI(
     version="0.2.0",
     description=(
         "Sync and detection API for pothole / road-crack reports. "
-        "The /reports routes require an Authorization: Bearer <SYNC_API_TOKEN> header."
+        "The /reports routes require an Authorization: Bearer <SYNC_API_TOKEN> header; "
+        "/detect is public but rate limited per client."
     ),
 )
 
@@ -68,6 +86,14 @@ def store_dependency() -> ReportStore:
     try:
         return get_store()
     except StorageNotConfigured as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+def limiter_dependency() -> RateLimiter:
+    """Injection point so tests can control the detection rate limit."""
+    try:
+        return get_limiter()
+    except RateLimitMisconfigured as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
@@ -130,11 +156,27 @@ def upload_limits() -> dict:
 
 @app.post("/detect")
 async def detect(
+    request: Request,
     image: UploadFile = File(...),
     latitude: Optional[float] = Form(None),
     longitude: Optional[float] = Form(None),
+    limiter: RateLimiter = Depends(limiter_dependency),
 ) -> dict:
     """Detect road defects in an uploaded image."""
+    decision = limiter.check(client_key(request))
+    if not decision.allowed:
+        retry_after = max(1, math.ceil(decision.retry_after))
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "error": "rate limit exceeded",
+                "limit": decision.limit,
+                "window_seconds": decision.window_seconds,
+                "retry_after_seconds": retry_after,
+            },
+            headers={"Retry-After": str(retry_after)},
+        )
+
     location = _resolve_location(latitude, longitude)
 
     # Starlette knows the size before the body is buffered when it can parse it.

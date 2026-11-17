@@ -2,23 +2,28 @@
 
 Synced reports carry GPS coordinates and damage observations, so neither
 ``POST /reports`` nor ``GET /reports`` is public. Both require a shared bearer
-token read from the ``SYNC_API_TOKEN`` environment variable.
+token from the ``SYNC_API_TOKEN`` environment variable.
 
-If the variable is unset the endpoints refuse to serve (503) rather than falling
+``SYNC_API_TOKEN`` accepts a comma- (or newline-) separated list so a token can
+be rotated without breaking the phone's sync:
+
+1. Deploy with the old and new token: ``SYNC_API_TOKEN=old-token,new-token``.
+2. Ship the phone build that uses the new token (both work meanwhile).
+3. Drop the old token: ``SYNC_API_TOKEN=new-token``.
+
+If no token is configured the endpoints refuse to serve (503) rather than falling
 back to open access: a missing secret is a configuration error, not permission.
 
 Generate a token with:
 
     python -c "import secrets; print(secrets.token_urlsafe(32))"
-
-and set it as ``SYNC_API_TOKEN`` in the deployment's environment variables.
 """
 
 from __future__ import annotations
 
 import os
 import secrets
-from typing import Optional
+from typing import Optional, Tuple
 
 from fastapi import Header, HTTPException
 
@@ -27,10 +32,20 @@ SYNC_TOKEN_ENV = "SYNC_API_TOKEN"
 _WWW_AUTHENTICATE = {"WWW-Authenticate": "Bearer"}
 
 
+def configured_tokens() -> Tuple[str, ...]:
+    """Tokens the server currently accepts, in configured order."""
+    raw = os.environ.get(SYNC_TOKEN_ENV) or ""
+    return tuple(
+        token.strip()
+        for token in raw.replace("\n", ",").split(",")
+        if token.strip()
+    )
+
+
 def require_sync_token(authorization: Optional[str] = Header(None)) -> None:
-    """Allow the request only with the configured bearer token."""
-    expected = os.environ.get(SYNC_TOKEN_ENV)
-    if not expected:
+    """Allow the request only with one of the configured bearer tokens."""
+    expected_tokens = configured_tokens()
+    if not expected_tokens:
         raise HTTPException(
             status_code=503,
             detail=(
@@ -47,8 +62,14 @@ def require_sync_token(authorization: Optional[str] = Header(None)) -> None:
             headers=_WWW_AUTHENTICATE,
         )
 
-    # Constant-time comparison so the token cannot be guessed byte by byte.
-    if not secrets.compare_digest(token.encode("utf-8"), expected.encode("utf-8")):
+    # Constant-time comparison, and every configured token is compared so the
+    # timing does not reveal which one matched.
+    supplied = token.encode("utf-8")
+    matched = False
+    for candidate in expected_tokens:
+        matched |= secrets.compare_digest(supplied, candidate.encode("utf-8"))
+
+    if not matched:
         raise HTTPException(
             status_code=401,
             detail="invalid token",

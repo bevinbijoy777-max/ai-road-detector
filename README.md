@@ -10,7 +10,8 @@ The Python OOP core in `python/` is the same domain model: detector, reports and
 | --- | --- |
 | `python/airoad` domain models, detectors, CLI, FastAPI sync API | Implemented, tested |
 | Report persistence (`DATABASE_URL` → Postgres, SQLite for dev) | Implemented, tested |
-| Report routes behind a bearer token (`SYNC_API_TOKEN`) | Implemented, tested |
+| Report routes behind a bearer token (`SYNC_API_TOKEN`, rotatable) | Implemented, tested |
+| Rate limiting on `/detect` (`DETECT_RATE_LIMIT`) | Implemented, tested |
 | Tests + CI (`.github/workflows/python-tests.yml`) | Implemented, runs on push/PR |
 | Vercel deployment (`app.py` entrypoint, `.python-version`) | Configured, see [Deploying on Vercel](#deploying-on-vercel) |
 | Android app (`android/`) — screens, `OnDeviceDetector`, Room store, `ReportSyncWorker`, Maps view | **Not in this repository yet** |
@@ -106,7 +107,7 @@ From a plain checkout without installing: `cd python && PYTHONPATH=. uvicorn air
 | --- | --- |
 | `GET /health` | Liveness probe; reports the active model and whether durable report storage is configured |
 | `GET /limits` | Upload size cap a client should check before sending a photo |
-| `POST /detect` | Multipart `image` plus optional `latitude`/`longitude` form fields → detection result JSON; **413** with the limit when the photo is too large |
+| `POST /detect` | Multipart `image` plus optional `latitude`/`longitude` form fields → detection result JSON; **413** with the limit when the photo is too large, **429** when rate limited |
 | `POST /reports` 🔒 | Persists the reports the phone queued offline; returns `accepted` / `stored` / `skipped` / `total_synced` |
 | `GET /reports` 🔒 | Already-synced reports, newest first (`?limit=`, default 50) |
 
@@ -144,10 +145,44 @@ curl -X POST -H "Authorization: Bearer $SYNC_API_TOKEN" \
      http://localhost:8000/reports
 ```
 
-The token is compared in constant time. With `SYNC_API_TOKEN` unset the routes answer
+The token is compared in constant time, and every configured token is checked so the
+timing does not reveal which one matched. With `SYNC_API_TOKEN` unset the routes answer
 **503** rather than opening up — a missing secret closes them instead of exposing
-coordinates. A wrong or absent header gets **401**. `GET /health`, `GET /limits` and
-`POST /detect` stay public.
+coordinates. A wrong or absent header gets **401**. `GET /health` and `GET /limits` stay
+public, and `POST /detect` stays public but rate limited (below).
+
+#### Rotating the token
+
+`SYNC_API_TOKEN` accepts a comma-separated list, so you can replace it without breaking
+the phone's sync:
+
+1. Deploy `SYNC_API_TOKEN=old-token,new-token` — both are accepted.
+2. Ship the phone build that sends `new-token`.
+3. Deploy `SYNC_API_TOKEN=new-token`; the old one now gets **401**.
+
+### Rate limiting
+
+`POST /detect` is public and spends CPU per call, so it is limited per client with a
+sliding window. Configure it with `DETECT_RATE_LIMIT` (default `30/minute`):
+
+```bash
+DETECT_RATE_LIMIT=60/minute   # per minute
+DETECT_RATE_LIMIT=5/second    # strict
+DETECT_RATE_LIMIT=off         # disable
+```
+
+A blocked call gets **429** with a `Retry-After` header and
+`{"error": "rate limit exceeded", "limit": …, "window_seconds": …, "retry_after_seconds": …}`.
+An unparseable value closes `/detect` with **503** instead of silently running unlimited.
+
+The caller is identified by peer address. Forwarded headers (`X-Forwarded-For`,
+`X-Real-IP`) are only trusted when `VERCEL` is set or `TRUST_PROXY_HEADERS=1`, so a
+client cannot dodge the limit by inventing a new header value on every request.
+
+Counters live in process memory, so on Vercel the limit applies **per function
+instance** rather than across the fleet. That stops a runaway loop from consuming one
+instance; an exact fleet-wide quota would need shared storage (Redis or the Postgres
+database).
 
 Point the Android worker URL (`ReportSyncWorker.DEFAULT_URL`) at your PC's LAN IP if you run this server.
 
@@ -205,8 +240,11 @@ Postgres works; Vercel Postgres is the shortest path:
 2. Copy the **pooled** connection string (contains `-pooler`) — serverless functions open
    many short-lived connections, which the pooler is built for.
 3. Add it to the project's environment variables as `DATABASE_URL`.
-4. Add `SYNC_API_TOKEN` — a long random string — as an environment variable too.
-   Without it both `/reports` routes answer **503**.
+4. Add `SYNC_API_TOKEN` — a long random string, or a comma-separated list while
+   rotating — as an environment variable too. Without it both `/reports` routes answer
+   **503**.
+5. Optionally set `DETECT_RATE_LIMIT` (default `30/minute`) to tune how hard the public
+   detection endpoint can be hit per instance.
 
 Redeploy after adding either variable, since environment changes only reach new
 function instances.

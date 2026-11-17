@@ -7,9 +7,10 @@ import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
 
-from airoad.api import app, store_dependency
+from airoad.api import app, limiter_dependency, store_dependency
 from airoad.auth import SYNC_TOKEN_ENV
 from airoad.limits import MAX_UPLOAD_BYTES
+from airoad.ratelimit import SlidingWindowLimiter
 from airoad.store import create_store
 
 SYNC_TOKEN = "test-token-123"
@@ -20,10 +21,13 @@ client = TestClient(app)
 
 @pytest.fixture(autouse=True)
 def configured(monkeypatch, tmp_path):
-    """A configured token and a throwaway database for every test."""
+    """A configured token, a throwaway database and a roomy limit per test."""
     monkeypatch.setenv(SYNC_TOKEN_ENV, SYNC_TOKEN)
     store = create_store(f"sqlite:///{tmp_path / 'reports.db'}")
     app.dependency_overrides[store_dependency] = lambda: store
+    app.dependency_overrides[limiter_dependency] = lambda: SlidingWindowLimiter(
+        limit=1000, window_seconds=60
+    )
     yield store
     app.dependency_overrides.clear()
 
@@ -32,6 +36,12 @@ def png_bytes(shade: int = 20) -> bytes:
     buffer = io.BytesIO()
     Image.fromarray(np.full((40, 40, 3), shade, dtype=np.uint8)).save(buffer, format="PNG")
     return buffer.getvalue()
+
+
+def detect(headers=None):
+    return client.post(
+        "/detect", files={"image": ("road.png", png_bytes(), "image/png")}, headers=headers
+    )
 
 
 def test_health_reports_the_offline_model_and_storage(monkeypatch):
@@ -265,3 +275,61 @@ def test_reports_return_503_when_storage_is_not_configured(monkeypatch):
         assert "DATABASE_URL" in response.json()["detail"]
     finally:
         get_store.cache_clear()
+
+
+# --- rate limiting on /detect ------------------------------------------------
+
+
+@pytest.fixture
+def strict_limiter():
+    """Allow two detect calls per window."""
+    limiter = SlidingWindowLimiter(limit=2, window_seconds=60)
+    app.dependency_overrides[limiter_dependency] = lambda: limiter
+    return limiter
+
+
+def test_detect_returns_429_after_the_limit(strict_limiter):
+    assert detect().status_code == 200
+    assert detect().status_code == 200
+
+    blocked = detect()
+    assert blocked.status_code == 429
+    detail = blocked.json()["detail"]
+    assert detail["error"] == "rate limit exceeded"
+    assert detail["limit"] == 2
+    assert detail["window_seconds"] == 60.0
+    assert detail["retry_after_seconds"] >= 1
+    assert int(blocked.headers["retry-after"]) >= 1
+
+
+def test_rate_limit_is_per_client(monkeypatch, strict_limiter):
+    monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
+    first = {"X-Forwarded-For": "1.1.1.1"}
+    assert detect(first).status_code == 200
+    assert detect(first).status_code == 200
+    assert detect(first).status_code == 429
+
+    # A different client still has its own allowance.
+    assert detect({"X-Forwarded-For": "2.2.2.2"}).status_code == 200
+
+
+def test_rate_limit_does_not_apply_to_reports(strict_limiter):
+    for _ in range(3):
+        detect()
+    # Exhausting detection does not lock the authenticated sync endpoint.
+    assert client.post("/reports", json=[{"report_id": "a"}], headers=AUTH).status_code == 200
+    assert client.get("/reports", headers=AUTH).status_code == 200
+
+
+def test_detect_closed_when_the_limit_is_misconfigured(monkeypatch):
+    from airoad.ratelimit import get_limiter
+
+    monkeypatch.setenv("DETECT_RATE_LIMIT", "banana")
+    app.dependency_overrides.pop(limiter_dependency, None)
+    get_limiter.cache_clear()
+    try:
+        response = detect()
+        assert response.status_code == 503
+        assert "DETECT_RATE_LIMIT" in response.json()["detail"]
+    finally:
+        get_limiter.cache_clear()

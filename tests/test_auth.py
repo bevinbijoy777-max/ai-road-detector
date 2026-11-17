@@ -3,7 +3,7 @@
 import pytest
 from fastapi import HTTPException
 
-from airoad.auth import SYNC_TOKEN_ENV, require_sync_token
+from airoad.auth import SYNC_TOKEN_ENV, configured_tokens, require_sync_token
 
 TOKEN = "s3cret-token"
 
@@ -50,3 +50,54 @@ def test_empty_token_setting_is_treated_as_unconfigured(monkeypatch):
     with pytest.raises(HTTPException) as excinfo:
         require_sync_token("Bearer ")
     assert excinfo.value.status_code == 503
+
+
+# --- rotation ---------------------------------------------------------------
+
+
+def test_both_tokens_work_during_a_rotation(monkeypatch):
+    monkeypatch.setenv(SYNC_TOKEN_ENV, "old-token,new-token")
+    assert require_sync_token("Bearer old-token") is None
+    assert require_sync_token("Bearer new-token") is None
+
+
+def test_only_the_new_token_works_after_the_rotation_finishes(monkeypatch):
+    monkeypatch.setenv(SYNC_TOKEN_ENV, "new-token")
+    assert require_sync_token("Bearer new-token") is None
+    with pytest.raises(HTTPException) as excinfo:
+        require_sync_token("Bearer old-token")
+    assert excinfo.value.status_code == 401
+
+
+def test_whitespace_and_newlines_separate_tokens(monkeypatch):
+    monkeypatch.setenv(SYNC_TOKEN_ENV, "  first ,\n second \n,third\n")
+    assert configured_tokens() == ("first", "second", "third")
+    for candidate in ("first", "second", "third"):
+        assert require_sync_token(f"Bearer {candidate}") is None
+
+
+def test_empty_entries_are_ignored(monkeypatch):
+    monkeypatch.setenv(SYNC_TOKEN_ENV, "token,,   ,")
+    assert configured_tokens() == ("token",)
+    assert require_sync_token("Bearer token") is None
+
+
+def test_a_list_of_only_separators_is_unconfigured(monkeypatch):
+    monkeypatch.setenv(SYNC_TOKEN_ENV, " , ,\n")
+    with pytest.raises(HTTPException) as excinfo:
+        require_sync_token("Bearer anything")
+    assert excinfo.value.status_code == 503
+
+
+def test_unknown_tokens_are_still_rejected_with_a_list(monkeypatch):
+    monkeypatch.setenv(SYNC_TOKEN_ENV, "old-token,new-token")
+    with pytest.raises(HTTPException) as excinfo:
+        require_sync_token("Bearer something-else")
+    assert excinfo.value.status_code == 401
+
+
+def test_tokens_are_not_matched_by_prefix(monkeypatch):
+    monkeypatch.setenv(SYNC_TOKEN_ENV, "abcdef,ghijkl")
+    for candidate in ("abc", "abcdefgh", "ghij"):
+        with pytest.raises(HTTPException):
+            require_sync_token(f"Bearer {candidate}")
