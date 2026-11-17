@@ -341,6 +341,15 @@ TEST_DATABASE_URL="postgresql+psycopg://postgres:airoad@127.0.0.1:55432/airoad_t
 docker rm -f airoad-pg
 ```
 
+`tests/test_postgres.py` proves one instance holds a single Postgres connection across
+the store, rate limiter and driver store. It skips when no Postgres is configured, so
+run it against the scratch database before tearing it down:
+
+```bash
+TEST_DATABASE_URL="postgresql+psycopg://postgres:airoad@127.0.0.1:55432/airoad_test" \
+  python -m pytest tests/test_postgres.py -q
+```
+
 Or against a hosted scratch database (Neon, Supabase, Vercel Postgres — a direct
 connection string is fine here, no pooler needed):
 
