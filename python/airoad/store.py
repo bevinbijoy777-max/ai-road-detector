@@ -136,20 +136,27 @@ def build_engine(database_url: str) -> Engine:
     return create_engine(database_url, **options)
 
 
-def create_store(database_url: Optional[str] = None) -> ReportStore:
-    """Build a store from an explicit URL or the environment."""
+def resolve_database_url(database_url: Optional[str] = None) -> str:
+    """Explicit URL, else ``DATABASE_URL``, else a local SQLite file.
+
+    A serverless filesystem is read-only apart from an ephemeral /tmp, so on
+    Vercel a local file would silently lose data; that is a configuration error.
+    """
     url = database_url or os.environ.get("DATABASE_URL")
     if url is None:
         if os.environ.get("VERCEL"):
-            # A serverless filesystem is read-only apart from an ephemeral /tmp,
-            # so a local SQLite file would silently lose every report.
             raise StorageNotConfigured(
                 "DATABASE_URL is not set. Add a Postgres connection string "
                 "(Vercel Postgres, Neon, Supabase, ...) to the project's "
                 "environment variables so synced reports survive."
             )
         url = DEFAULT_SQLITE_URL
-    return SqlReportStore(build_engine(url))
+    return url
+
+
+def create_store(database_url: Optional[str] = None) -> ReportStore:
+    """Build a store from an explicit URL or the environment."""
+    return SqlReportStore(build_engine(resolve_database_url(database_url)))
 
 
 @lru_cache(maxsize=1)

@@ -1,6 +1,7 @@
 """Rate limiter tests."""
 
 import pytest
+from sqlalchemy import func, select
 from starlette.requests import Request
 
 from airoad.ratelimit import (
@@ -8,16 +9,18 @@ from airoad.ratelimit import (
     RATE_LIMIT_ENV,
     NoopLimiter,
     RateLimitMisconfigured,
-    SlidingWindowLimiter,
+    SqlRateLimiter,
+    attempts_table,
     client_key,
     create_limiter,
     parse_rate_limit,
 )
+from airoad.store import StorageNotConfigured, build_engine
 
 
 class FakeClock:
     def __init__(self) -> None:
-        self.now = 0.0
+        self.now = 1_000.0
 
     def __call__(self) -> float:
         return self.now
@@ -37,6 +40,30 @@ def make_request(headers=None, client=("1.2.3.4", 1234)) -> Request:
             "client": client,
         }
     )
+
+
+@pytest.fixture
+def database_url(tmp_path):
+    return f"sqlite:///{tmp_path / 'rate.db'}"
+
+
+def build_limiter(database_url, limit=3, window_seconds=60, clock=None) -> SqlRateLimiter:
+    return SqlRateLimiter(
+        build_engine(database_url),
+        limit=limit,
+        window_seconds=window_seconds,
+        clock=clock or FakeClock(),
+    )
+
+
+def stored_attempts(database_url) -> int:
+    engine = build_engine(database_url)
+    with engine.connect() as connection:
+        return int(
+            connection.execute(
+                select(func.count()).select_from(attempts_table)
+            ).scalar_one()
+        )
 
 
 # --- parsing ----------------------------------------------------------------
@@ -71,31 +98,49 @@ def test_default_is_thirty_per_minute():
     assert parse_rate_limit(DEFAULT_RATE_LIMIT) == (30, 60.0)
 
 
-def test_create_limiter_reads_the_environment(monkeypatch):
+def test_create_limiter_reads_the_environment(monkeypatch, database_url):
     monkeypatch.setenv(RATE_LIMIT_ENV, "4/minute")
+    monkeypatch.setenv("DATABASE_URL", database_url)
     limiter = create_limiter()
-    assert isinstance(limiter, SlidingWindowLimiter)
-    assert limiter.limit == 4
-    assert limiter.window_seconds == 60.0
+
+    assert isinstance(limiter, SqlRateLimiter)
+    assert all(limiter.check("ip").allowed for _ in range(4))
+    assert limiter.check("ip").allowed is False
 
 
-def test_create_limiter_returns_noop_when_off(monkeypatch):
+def test_create_limiter_returns_noop_when_off(monkeypatch, database_url):
     monkeypatch.setenv(RATE_LIMIT_ENV, "off")
+    monkeypatch.setenv("DATABASE_URL", database_url)
     assert isinstance(create_limiter(), NoopLimiter)
 
 
-def test_create_limiter_uses_the_default_when_unset(monkeypatch):
-    monkeypatch.delenv(RATE_LIMIT_ENV, raising=False)
-    limiter = create_limiter()
-    assert isinstance(limiter, SlidingWindowLimiter)
-    assert limiter.limit == 30
+def test_shared_limiter_needs_a_database_on_vercel(monkeypatch):
+    monkeypatch.setenv("VERCEL", "1")
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    with pytest.raises(StorageNotConfigured):
+        create_limiter("5/minute")
 
 
-# --- sliding window ---------------------------------------------------------
+def test_noop_limiter_never_blocks():
+    limiter = NoopLimiter()
+    for _ in range(1000):
+        assert limiter.check("ip").allowed
 
 
-def test_allows_up_to_the_limit_then_blocks():
-    limiter = SlidingWindowLimiter(limit=3, window_seconds=60, clock=FakeClock())
+@pytest.mark.parametrize(
+    "kwargs",
+    [{"limit": 0, "window_seconds": 60}, {"limit": 5, "window_seconds": 0}],
+)
+def test_invalid_construction_is_rejected(database_url, kwargs):
+    with pytest.raises(ValueError):
+        SqlRateLimiter(build_engine(database_url), **kwargs)
+
+
+# --- counting ---------------------------------------------------------------
+
+
+def test_allows_up_to_the_limit_then_blocks(database_url):
+    limiter = build_limiter(database_url, limit=3)
 
     decisions = [limiter.check("ip") for _ in range(3)]
     assert all(decision.allowed for decision in decisions)
@@ -105,57 +150,63 @@ def test_allows_up_to_the_limit_then_blocks():
     assert blocked.allowed is False
     assert blocked.remaining == 0
     assert blocked.limit == 3
-    assert blocked.window_seconds == 60
+    assert blocked.window_seconds == 60.0
+    assert blocked.retry_after == pytest.approx(60.0)
 
 
-def test_reports_how_long_to_wait():
+def test_window_slides_so_the_client_recovers(database_url):
     clock = FakeClock()
-    limiter = SlidingWindowLimiter(limit=1, window_seconds=60, clock=clock)
-    assert limiter.check("ip").allowed
+    limiter = build_limiter(database_url, limit=2, window_seconds=10, clock=clock)
 
-    clock.advance(15)
-    blocked = limiter.check("ip")
-    assert blocked.allowed is False
-    assert blocked.retry_after == pytest.approx(45.0)
-
-
-def test_window_slides_so_the_client_recovers():
-    clock = FakeClock()
-    limiter = SlidingWindowLimiter(limit=2, window_seconds=10, clock=clock)
     assert limiter.check("ip").allowed
     clock.advance(6)
     assert limiter.check("ip").allowed
     assert limiter.check("ip").allowed is False
 
-    # The first call falls out of the window, freeing one slot.
+    # The first attempt falls out of the window, freeing one slot.
     clock.advance(5)
     assert limiter.check("ip").allowed
 
 
-def test_clients_are_limited_independently():
-    limiter = SlidingWindowLimiter(limit=1, window_seconds=60, clock=FakeClock())
+def test_retry_after_shrinks_as_the_window_passes(database_url):
+    clock = FakeClock()
+    limiter = build_limiter(database_url, limit=1, window_seconds=60, clock=clock)
+    assert limiter.check("ip").allowed
+
+    clock.advance(45)
+    assert limiter.check("ip").retry_after == pytest.approx(15.0)
+
+
+def test_clients_are_limited_independently(database_url):
+    limiter = build_limiter(database_url, limit=1)
     assert limiter.check("a").allowed
     assert limiter.check("a").allowed is False
     assert limiter.check("b").allowed
 
 
-def test_reset_clears_state():
-    limiter = SlidingWindowLimiter(limit=1, window_seconds=60, clock=FakeClock())
-    assert limiter.check("ip").allowed
-    limiter.reset()
-    assert limiter.check("ip").allowed
+def test_the_limit_is_shared_between_instances(database_url):
+    """Two limiter objects stand in for two serverless instances."""
+    clock = FakeClock()
+    instance_one = build_limiter(database_url, limit=3, clock=clock)
+    instance_two = build_limiter(database_url, limit=3, clock=clock)
+
+    assert instance_one.check("ip").allowed
+    assert instance_one.check("ip").allowed
+    assert instance_two.check("ip").allowed  # third of three, seen by other instance
+    assert instance_two.check("ip").allowed is False
 
 
-def test_noop_limiter_never_blocks():
-    limiter = NoopLimiter()
-    for _ in range(1000):
+def test_expired_attempts_are_removed(database_url):
+    clock = FakeClock()
+    limiter = build_limiter(database_url, limit=5, window_seconds=10, clock=clock)
+
+    for _ in range(3):
         assert limiter.check("ip").allowed
+    assert stored_attempts(database_url) == 3
 
-
-@pytest.mark.parametrize("kwargs", [{"limit": 0, "window_seconds": 60}, {"limit": 5, "window_seconds": 0}])
-def test_invalid_construction_is_rejected(kwargs):
-    with pytest.raises(ValueError):
-        SlidingWindowLimiter(**kwargs)
+    clock.advance(11)
+    assert limiter.check("ip").allowed
+    assert stored_attempts(database_url) == 1
 
 
 # --- client identity --------------------------------------------------------
@@ -186,12 +237,6 @@ def test_client_key_honours_forwarded_headers_behind_a_proxy(monkeypatch, env):
 
     request = make_request({"X-Forwarded-For": "9.9.9.9, 10.0.0.1"})
     assert client_key(request) == "9.9.9.9"
-
-
-def test_client_key_falls_back_to_x_real_ip(monkeypatch):
-    monkeypatch.setenv("VERCEL", "1")
-    request = make_request({"X-Real-IP": "8.8.8.8"})
-    assert client_key(request) == "8.8.8.8"
 
 
 def test_client_key_handles_a_missing_peer_address(monkeypatch):

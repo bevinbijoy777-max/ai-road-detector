@@ -10,7 +10,7 @@ from PIL import Image
 from airoad.api import app, limiter_dependency, store_dependency
 from airoad.auth import SYNC_TOKEN_ENV
 from airoad.limits import MAX_UPLOAD_BYTES
-from airoad.ratelimit import SlidingWindowLimiter
+from airoad.ratelimit import create_limiter, get_limiter
 from airoad.store import create_store
 
 SYNC_TOKEN = "test-token-123"
@@ -25,8 +25,8 @@ def configured(monkeypatch, tmp_path):
     monkeypatch.setenv(SYNC_TOKEN_ENV, SYNC_TOKEN)
     store = create_store(f"sqlite:///{tmp_path / 'reports.db'}")
     app.dependency_overrides[store_dependency] = lambda: store
-    app.dependency_overrides[limiter_dependency] = lambda: SlidingWindowLimiter(
-        limit=1000, window_seconds=60
+    app.dependency_overrides[limiter_dependency] = lambda: create_limiter(
+        "1000/minute", f"sqlite:///{tmp_path / 'detect-rate.db'}"
     )
     yield store
     app.dependency_overrides.clear()
@@ -281,9 +281,9 @@ def test_reports_return_503_when_storage_is_not_configured(monkeypatch):
 
 
 @pytest.fixture
-def strict_limiter():
-    """Allow two detect calls per window."""
-    limiter = SlidingWindowLimiter(limit=2, window_seconds=60)
+def strict_limiter(tmp_path):
+    """Allow two detect calls per window, shared through a database."""
+    limiter = create_limiter("2/minute", f"sqlite:///{tmp_path / 'strict-rate.db'}")
     app.dependency_overrides[limiter_dependency] = lambda: limiter
     return limiter
 
@@ -322,8 +322,6 @@ def test_rate_limit_does_not_apply_to_reports(strict_limiter):
 
 
 def test_detect_closed_when_the_limit_is_misconfigured(monkeypatch):
-    from airoad.ratelimit import get_limiter
-
     monkeypatch.setenv("DETECT_RATE_LIMIT", "banana")
     app.dependency_overrides.pop(limiter_dependency, None)
     get_limiter.cache_clear()
@@ -331,5 +329,19 @@ def test_detect_closed_when_the_limit_is_misconfigured(monkeypatch):
         response = detect()
         assert response.status_code == 503
         assert "DETECT_RATE_LIMIT" in response.json()["detail"]
+    finally:
+        get_limiter.cache_clear()
+
+
+def test_detect_needs_a_database_on_vercel(monkeypatch):
+    """Without shared storage the limit cannot hold, so /detect refuses to run."""
+    monkeypatch.setenv("VERCEL", "1")
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    app.dependency_overrides.pop(limiter_dependency, None)
+    get_limiter.cache_clear()
+    try:
+        response = detect()
+        assert response.status_code == 503
+        assert "DATABASE_URL" in response.json()["detail"]
     finally:
         get_limiter.cache_clear()

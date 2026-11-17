@@ -11,7 +11,7 @@ The Python OOP core in `python/` is the same domain model: detector, reports and
 | `python/airoad` domain models, detectors, CLI, FastAPI sync API | Implemented, tested |
 | Report persistence (`DATABASE_URL` → Postgres, SQLite for dev) | Implemented, tested |
 | Report routes behind a bearer token (`SYNC_API_TOKEN`, rotatable) | Implemented, tested |
-| Rate limiting on `/detect` (`DETECT_RATE_LIMIT`) | Implemented, tested |
+| Rate limiting on `/detect` (`DETECT_RATE_LIMIT`, shared via `DATABASE_URL`) | Implemented, tested |
 | Tests + CI (`.github/workflows/python-tests.yml`) | Implemented, runs on push/PR |
 | Vercel deployment (`app.py` entrypoint, `.python-version`) | Configured, see [Deploying on Vercel](#deploying-on-vercel) |
 | Android app (`android/`) — screens, `OnDeviceDetector`, Room store, `ReportSyncWorker`, Maps view | **Not in this repository yet** |
@@ -162,8 +162,10 @@ the phone's sync:
 
 ### Rate limiting
 
-`POST /detect` is public and spends CPU per call, so it is limited per client with a
-sliding window. Configure it with `DETECT_RATE_LIMIT` (default `30/minute`):
+`POST /detect` is public and spends CPU per call, so it is limited per client. Attempts
+are recorded in the `DATABASE_URL` database, so the limit is **shared by every function
+instance** instead of resetting on each one. Configure it with `DETECT_RATE_LIMIT`
+(default `30/minute`):
 
 ```bash
 DETECT_RATE_LIMIT=60/minute   # per minute
@@ -175,14 +177,19 @@ A blocked call gets **429** with a `Retry-After` header and
 `{"error": "rate limit exceeded", "limit": …, "window_seconds": …, "retry_after_seconds": …}`.
 An unparseable value closes `/detect` with **503** instead of silently running unlimited.
 
-The caller is identified by peer address. Forwarded headers (`X-Forwarded-For`,
-`X-Real-IP`) are only trusted when `VERCEL` is set or `TRUST_PROXY_HEADERS=1`, so a
-client cannot dodge the limit by inventing a new header value on every request.
+The caller is identified by peer address. Forwarded headers (`X-Forwarded-For`) are only
+trusted when `VERCEL` is set or `TRUST_PROXY_HEADERS=1`, so a client cannot dodge the
+limit by inventing a new header value on every request.
 
-Counters live in process memory, so on Vercel the limit applies **per function
-instance** rather than across the fleet. That stops a runaway loop from consuming one
-instance; an exact fleet-wide quota would need shared storage (Redis or the Postgres
-database).
+Each admitted call writes one row to a `detect_attempts` table, created on first use and
+pruned of expired rows as the limiter runs. That costs one small round trip per detection
+to the database the reports already use. Two requests arriving in the same instant can
+both pass, so the window may be exceeded by a small margin — it is a guardrail, not an
+exact quota.
+
+Because the counter is shared storage, `/detect` needs `DATABASE_URL` on Vercel too: with
+no database there is no shared limit, so the endpoint answers **503** rather than running
+unprotected. Locally it falls back to the same SQLite file as the reports.
 
 Point the Android worker URL (`ReportSyncWorker.DEFAULT_URL`) at your PC's LAN IP if you run this server.
 
@@ -244,7 +251,10 @@ Postgres works; Vercel Postgres is the shortest path:
    rotating — as an environment variable too. Without it both `/reports` routes answer
    **503**.
 5. Optionally set `DETECT_RATE_LIMIT` (default `30/minute`) to tune how hard the public
-   detection endpoint can be hit per instance.
+   detection endpoint can be hit.
+
+`DATABASE_URL` is required by both `/reports` (persistence) and `/detect` (the shared rate
+limit), so a deployment without it answers 503 on both.
 
 Redeploy after adding either variable, since environment changes only reach new
 function instances.

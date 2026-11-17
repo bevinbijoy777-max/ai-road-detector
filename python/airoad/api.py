@@ -93,7 +93,9 @@ def limiter_dependency() -> RateLimiter:
     """Injection point so tests can control the detection rate limit."""
     try:
         return get_limiter()
-    except RateLimitMisconfigured as exc:
+    except (RateLimitMisconfigured, StorageNotConfigured) as exc:
+        # A limiter that cannot be built would leave the public endpoint
+        # unprotected, so deny instead of running unlimited.
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
