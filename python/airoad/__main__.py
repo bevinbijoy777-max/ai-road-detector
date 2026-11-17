@@ -8,6 +8,12 @@ import sys
 from typing import Optional, Sequence
 
 from airoad.detector import OfflineDetectorFacade
+from airoad.limits import (
+    MAX_UPLOAD_BYTES,
+    UploadTooLargeError,
+    check_upload_file,
+    format_size,
+)
 from airoad.models import DetectionResult, GeoLocation
 
 
@@ -24,6 +30,15 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         dest="as_json",
         help="print the full detection result as JSON",
+    )
+    parser.add_argument(
+        "--check-upload",
+        action="store_true",
+        dest="check_upload",
+        help=(
+            "only check whether the image fits the "
+            f"{format_size(MAX_UPLOAD_BYTES)} upload limit (exit 3 if it does not)"
+        ),
     )
     return parser
 
@@ -46,9 +61,29 @@ def format_human(result: DetectionResult) -> str:
     return "\n".join(lines)
 
 
+def _check_upload(image: str) -> int:
+    """Report whether a photo fits the upload limit, without detecting anything."""
+    try:
+        size = check_upload_file(image)
+    except FileNotFoundError:
+        print(f"error: no such image: {image}", file=sys.stderr)
+        return 2
+    except UploadTooLargeError as exc:
+        print(f"too large: {exc}", file=sys.stderr)
+        return 3
+    print(
+        f"{image}: {format_size(size)} - fits the "
+        f"{format_size(MAX_UPLOAD_BYTES)} upload limit"
+    )
+    return 0
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    if args.check_upload:
+        return _check_upload(args.image)
 
     if (args.lat is None) != (args.lng is None):
         parser.error("--lat and --lng must be provided together")

@@ -9,6 +9,7 @@ The Python OOP core in `python/` is the same domain model: detector, reports and
 | Piece | State |
 | --- | --- |
 | `python/airoad` domain models, detectors, CLI, FastAPI sync API | Implemented, tested |
+| Report persistence (`DATABASE_URL` → Postgres, SQLite for dev) | Implemented, tested |
 | Tests + CI (`.github/workflows/python-tests.yml`) | Implemented, runs on push/PR |
 | Vercel deployment (`app.py` entrypoint, `.python-version`) | Configured, see [Deploying on Vercel](#deploying-on-vercel) |
 | Android app (`android/`) — screens, `OnDeviceDetector`, Room store, `ReportSyncWorker`, Maps view | **Not in this repository yet** |
@@ -69,7 +70,17 @@ $env:PYTHONPATH="python"
 python -m airoad path\to\road.jpg --lat 12.9716 --lng 77.5946
 ```
 
-Add `--json` for machine-readable output. Exit codes: `0` success, `2` missing/unreadable image or invalid coordinates.
+Add `--json` for machine-readable output. Exit codes: `0` success, `2` missing/unreadable
+image or invalid coordinates, `3` photo over the upload limit.
+
+Check whether a photo fits the 4.5 MB upload cap before sending it:
+
+```bash
+airoad path/to/road.jpg --check-upload
+# path/to/road.jpg: 1.2 MB - fits the 4.5 MB upload limit
+```
+
+Exit code `3` means it is over the limit and should be downscaled first.
 
 Sample output:
 
@@ -92,13 +103,27 @@ From a plain checkout without installing: `cd python && PYTHONPATH=. uvicorn air
 
 | Endpoint | Purpose |
 | --- | --- |
-| `GET /health` | Liveness probe; reports the active model name |
-| `POST /detect` | Multipart `image` file plus optional `latitude`/`longitude` form fields → detection result JSON |
-| `POST /reports` | Accepts the JSON array of reports the phone queued offline; returns how many were accepted |
+| `GET /health` | Liveness probe; reports the active model and whether durable report storage is configured |
+| `GET /limits` | Upload size cap a client should check before sending a photo |
+| `POST /detect` | Multipart `image` plus optional `latitude`/`longitude` form fields → detection result JSON; **413** with the limit when the photo is too large |
+| `POST /reports` | Persists the reports the phone queued offline; returns `accepted` / `stored` / `skipped` / `total_synced` |
+| `GET /reports` | Already-synced reports, newest first (`?limit=`, default 50) |
 
 Interactive docs are served at `http://localhost:8000/docs`.
 
-`POST /reports` only keeps an in-memory acknowledgement log — swap it for a database before using this anywhere that must survive a restart.
+### Report storage
+
+Synced reports go through `airoad/store.py`, which speaks SQL through SQLAlchemy and is
+configured by `DATABASE_URL`:
+
+- **Set** (`postgresql://…` or `sqlite:///…`) — reports are written there and a `reports`
+  table is created on first use.
+- **Unset** — local development falls back to `sqlite:///reports.db` (gitignored). On
+  Vercel a fallback file would silently lose data, so `/reports` answers **503** instead
+  and `/health` reports `"durable_report_storage": false`.
+
+`report_id` is the table's primary key, so a phone retrying an upload after a dropped
+connection does not create duplicates: the repeat is reported in `skipped`.
 
 Point the Android worker URL (`ReportSyncWorker.DEFAULT_URL`) at your PC's LAN IP if you run this server.
 
@@ -146,12 +171,20 @@ configure. Dependencies are installed from `requirements.txt` / `pyproject.toml`
 | 500 MB uncompressed function bundle (Python) | Plenty for numpy + Pillow. |
 | 300 s max duration on Hobby | Detection resizes to 224 px and finishes in well under a second. |
 
-`POST /reports` keeps its acknowledgement count in process memory. On Vercel each
-instance has its own memory and instances are recycled, so the count resets and is not
-shared between instances — treat the endpoint as a transport for the upload, not as
-durable storage. Point it at a database before relying on it.
+### Give the deployment a database
 
-`GET /health` is a cheap way to confirm a fresh deployment is serving.
+Without `DATABASE_URL`, `/reports` answers **503** on Vercel: a serverless filesystem is
+read-only apart from an ephemeral `/tmp`, so there is nowhere durable to write. Any
+Postgres works; Vercel Postgres is the shortest path:
+
+1. In the Vercel project open **Storage → Create → Postgres** (or use Neon/Supabase).
+2. Copy the **pooled** connection string (contains `-pooler`) — serverless functions open
+   many short-lived connections, which the pooler is built for.
+3. Add it to the project's environment variables as `DATABASE_URL` and redeploy.
+
+`GET /health` then reports `"durable_report_storage": true`, and the `reports` table is
+created on the first upload. Reports outlive individual instances because they are in the
+database, not in the function's memory.
 
 ## OOP layout
 
@@ -161,6 +194,8 @@ durable storage. Point it at a database before relying on it.
 | `BaseDetector` | Abstract detector |
 | `HeuristicDetector`, `TFLiteDetector` | On-device implementations (`airoad/detector.py`) |
 | `OfflineDetectorFacade` | Chooses a local model |
+| `ReportStore`, `SqlReportStore` | Report persistence (`airoad/store.py`) |
+| `MAX_UPLOAD_BYTES`, `check_upload_size`, `check_upload_file` | Upload limit helpers (`airoad/limits.py`) |
 
 ## Tests and CI
 
@@ -169,7 +204,9 @@ pip install -r requirements-dev.txt
 python -m pytest -q
 ```
 
-`conftest.py` puts `python/` on `sys.path`, so tests run from the repository root without installing the package. Coverage: domain models, detector behaviour (including failure modes), the FastAPI endpoints and the CLI.
+`conftest.py` puts `python/` on `sys.path`, so tests run from the repository root without installing the package. Coverage: domain models, detector behaviour (including failure modes), report persistence
+(including survival across a fresh store instance and duplicate suppression), upload limits,
+the FastAPI endpoints and the CLI.
 
 `.github/workflows/python-tests.yml` runs the suite on Python 3.10 and 3.12 for every push to `main` and every pull request, then smoke-tests the API and CLI imports.
 

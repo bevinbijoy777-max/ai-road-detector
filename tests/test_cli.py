@@ -7,6 +7,7 @@ import pytest
 from PIL import Image
 
 from airoad.__main__ import main
+from airoad.limits import MAX_UPLOAD_BYTES
 
 
 def write_image(tmp_path, shade: int = 20) -> str:
@@ -34,6 +35,26 @@ def test_cli_prints_a_human_summary(tmp_path, capsys):
 
 def test_cli_reports_a_missing_file(tmp_path, capsys):
     assert main([str(tmp_path / "nope.png")]) == 2
+    assert "no such image" in capsys.readouterr().err
+
+
+def test_check_upload_accepts_a_small_photo(tmp_path, capsys):
+    assert main([write_image(tmp_path), "--check-upload"]) == 0
+    output = capsys.readouterr().out
+    assert "fits the 4.5 MB upload limit" in output
+
+
+def test_check_upload_flags_an_oversized_photo(tmp_path, capsys):
+    big = tmp_path / "huge.jpg"
+    big.write_bytes(b"\0" * (MAX_UPLOAD_BYTES + 1))
+    assert main([str(big), "--check-upload"]) == 3
+    error = capsys.readouterr().err
+    assert "too large" in error
+    assert "downscale" in error
+
+
+def test_check_upload_reports_a_missing_file(tmp_path, capsys):
+    assert main([str(tmp_path / "nope.jpg"), "--check-upload"]) == 2
     assert "no such image" in capsys.readouterr().err
 
 

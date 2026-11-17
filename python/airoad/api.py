@@ -3,11 +3,12 @@
 Two jobs:
 
 * ``POST /detect`` re-runs the on-device detector on a server (useful for testing
-  and for browsers/clients without a local model).
+  and for clients without a local model).
 * ``POST /reports`` is the endpoint the Android ``ReportSyncWorker`` uploads queued
-  offline reports to once the phone is back online.
+  offline reports to once the phone is back online. Reports are persisted through
+  :mod:`airoad.store`, so they survive the instance that handled the upload.
 
-Run it from the ``python/`` directory:
+Run it locally:
 
     uvicorn airoad.api:app --host 0.0.0.0 --port 8000
 
@@ -17,26 +18,65 @@ sync reports later.
 
 from __future__ import annotations
 
+import os
 import tempfile
 from pathlib import Path
 from typing import List, Optional
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile
+from pydantic import BaseModel, Field
 
 from airoad.detector import OfflineDetectorFacade
+from airoad.limits import MAX_UPLOAD_BYTES, MAX_UPLOAD_MB, format_size
 from airoad.models import GeoLocation
+from airoad.store import ReportStore, StorageNotConfigured, get_store
 
 app = FastAPI(
     title="AI Road Detector",
-    version="0.1.0",
+    version="0.2.0",
     description="Sync and detection API for pothole / road-crack reports.",
 )
 
 _detector = OfflineDetectorFacade()
 
-# In-memory acknowledgement log for synced reports. Swap for a real database
-# before running this anywhere that needs to survive a restart.
-_synced_reports: List[dict] = []
+
+class SyncedReport(BaseModel):
+    """A report the phone queued while offline.
+
+    ``report_id`` is required because it is the storage key; any other field the
+    client sends (predictions, location, notes, ...) is stored verbatim.
+    """
+
+    model_config = {"extra": "allow"}
+
+    report_id: str = Field(min_length=1)
+
+
+def store_dependency() -> ReportStore:
+    """Injection point so tests can supply a throwaway database.
+
+    A deployment without a usable database answers 503 rather than failing every
+    request with a stack trace.
+    """
+    try:
+        return get_store()
+    except StorageNotConfigured as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+def _too_large(size_bytes: int) -> HTTPException:
+    return HTTPException(
+        status_code=413,
+        detail={
+            "error": "image too large",
+            "size_bytes": size_bytes,
+            "max_upload_bytes": MAX_UPLOAD_BYTES,
+            "message": (
+                f"image is {format_size(size_bytes)}, over the "
+                f"{format_size(MAX_UPLOAD_BYTES)} upload limit - downscale it first"
+            ),
+        },
+    )
 
 
 def _resolve_location(
@@ -59,8 +99,26 @@ def _resolve_location(
 
 @app.get("/health")
 def health() -> dict:
-    """Liveness probe that also reports which model the service would use."""
-    return {"status": "ok", "model": _detector.model_name, "offline_detection": True}
+    """Liveness probe that also reports the active model and storage backend."""
+    return {
+        "status": "ok",
+        "model": _detector.model_name,
+        "offline_detection": True,
+        "durable_report_storage": bool(os.environ.get("DATABASE_URL")),
+    }
+
+
+@app.get("/limits")
+def upload_limits() -> dict:
+    """Upload limits a client should check before sending a photo."""
+    return {
+        "max_upload_bytes": MAX_UPLOAD_BYTES,
+        "max_upload_mb": round(MAX_UPLOAD_MB, 2),
+        "note": (
+            "Vercel rejects request bodies above this at the edge with a 413 "
+            "before the function runs, so downscale larger photos on the device."
+        ),
+    }
 
 
 @app.post("/detect")
@@ -71,9 +129,17 @@ async def detect(
 ) -> dict:
     """Detect road defects in an uploaded image."""
     location = _resolve_location(latitude, longitude)
+
+    # Starlette knows the size before the body is buffered when it can parse it.
+    declared_size = getattr(image, "size", None)
+    if declared_size is not None and declared_size > MAX_UPLOAD_BYTES:
+        raise _too_large(declared_size)
+
     raw = await image.read()
     if not raw:
         raise HTTPException(status_code=400, detail="empty image upload")
+    if len(raw) > MAX_UPLOAD_BYTES:
+        raise _too_large(len(raw))
 
     suffix = Path(image.filename or "upload.jpg").suffix or ".jpg"
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as handle:
@@ -96,7 +162,24 @@ async def detect(
 
 
 @app.post("/reports")
-def sync_reports(reports: List[dict]) -> dict:
+def sync_reports(
+    reports: List[SyncedReport],
+    store: ReportStore = Depends(store_dependency),
+) -> dict:
     """Accept reports the phone queued while offline."""
-    _synced_reports.extend(reports)
-    return {"accepted": len(reports), "total_synced": len(_synced_reports)}
+    outcome = store.add_many([report.model_dump() for report in reports])
+    return {
+        "accepted": outcome.received,
+        "stored": outcome.stored,
+        "skipped": outcome.skipped,
+        "total_synced": outcome.total,
+    }
+
+
+@app.get("/reports")
+def list_reports(
+    limit: int = Query(50, ge=1, le=500),
+    store: ReportStore = Depends(store_dependency),
+) -> dict:
+    """Reports already synced, newest first."""
+    return {"reports": store.list_reports(limit), "total_synced": store.count()}

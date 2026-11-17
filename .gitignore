@@ -14,6 +14,10 @@ htmlcov/
 venv/
 env/
 
+# Local SQLite database (dev default when DATABASE_URL is unset)
+reports.db
+*.db-journal
+
 # Secret / machine-local config
 .env
 android/local.properties
