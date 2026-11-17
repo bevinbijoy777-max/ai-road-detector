@@ -1,0 +1,101 @@
+"""Engine tests: one connection per instance, reused.
+
+Every Vercel function instance builds its own engine, so it must hold exactly one
+Postgres connection and reuse it - a fresh connection per statement would both
+exhaust Postgres and make a sync batch reconnect once per report. Nothing here
+opens a Postgres socket: ``create_engine`` resolves the dialect and pool without
+connecting, and reuse is asserted against a local SQLite engine instead.
+"""
+
+import pytest
+from sqlalchemy import event
+from sqlalchemy.pool import QueuePool
+
+from airoad.db import (
+    POOL_RECYCLE_SECONDS,
+    POOL_TIMEOUT_SECONDS,
+    POSTGRES_POOL_SIZE,
+    build_engine,
+)
+from airoad.store import SqlReportStore
+
+#: Pooled and direct URLs in the shapes the providers hand out. No credentials,
+#: and no connection is ever made.
+POOLED_URLS = [
+    "postgresql://user:pass@ep-cool-name-123456-pooler.us-east-2.aws.neon.tech/neondb",
+    "postgresql+psycopg://user:pass@ep-cool-name-123456-pooler.us-east-2.aws.neon.tech/neondb",
+    "postgresql://default:pass@ep-cool-name-123456-pooler.us-east-1.postgres.vercel-storage.com/verceldb",
+    "postgresql://postgres.abcdefgh:pass@aws-0-us-east-1.pooler.supabase.com:6543/postgres",
+]
+
+DIRECT_URLS = [
+    "postgresql://user:pass@ep-cool-name-123456.us-east-2.aws.neon.tech/neondb",
+    "postgresql+psycopg://user:pass@db.example.com:5432/airoad",
+]
+
+
+@pytest.mark.parametrize("url", POOLED_URLS + DIRECT_URLS)
+def test_postgres_keeps_and_reuses_one_connection(url):
+    """A pooled URL must pool client-side too, or each query reconnects."""
+    engine = build_engine(url)
+    try:
+        assert isinstance(engine.pool, QueuePool)
+        assert engine.pool.size() == POSTGRES_POOL_SIZE == 1
+        assert engine.pool._max_overflow == 0
+        assert engine.pool._pre_ping is True
+        assert engine.pool._timeout == POOL_TIMEOUT_SECONDS
+        assert engine.pool._recycle == POOL_RECYCLE_SECONDS
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.parametrize("url", POOLED_URLS + DIRECT_URLS)
+def test_n_instances_hold_n_connections_not_fifteen(url):
+    """SQLAlchemy's default 5 + 10 overflow per instance is what exhausted Postgres."""
+    engines = [build_engine(url) for _ in range(20)]
+    try:
+        assert sum(engine.pool.size() for engine in engines) == 20
+    finally:
+        for engine in engines:
+            engine.dispose()
+
+
+def test_sequential_checkouts_reuse_the_same_dbapi_connection(tmp_path):
+    engine = build_engine(f"sqlite:///{tmp_path / 'reuse.db'}")
+    try:
+        with engine.connect() as first:
+            first.exec_driver_sql("select 1")
+            first_raw = first.connection.dbapi_connection
+        with engine.connect() as second:
+            second.exec_driver_sql("select 1")
+            assert second.connection.dbapi_connection is first_raw
+    finally:
+        engine.dispose()
+
+
+def test_sync_batch_opens_one_connection_for_every_report(tmp_path):
+    """The motivation: add_many loops per report, and must not reconnect per report."""
+    engine = build_engine(f"sqlite:///{tmp_path / 'batch.db'}")
+    connects = []
+    event.listen(engine, "connect", lambda *args: connects.append(1))
+    try:
+        store = SqlReportStore(engine)
+        outcome = store.add_many(
+            "driver-1", [{"report_id": f"r{i}"} for i in range(5)]
+        )
+
+        assert outcome.stored == 5
+        assert store.count("driver-1") == 5
+        assert len(connects) == 1
+    finally:
+        engine.dispose()
+
+
+def test_sqlite_fallback_keeps_sharing_connections_between_threads(tmp_path):
+    """The dev/test database must stay usable from TestClient's worker thread."""
+    engine = build_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    try:
+        with engine.connect() as connection:
+            assert connection.exec_driver_sql("select 1").scalar_one() == 1
+    finally:
+        engine.dispose()

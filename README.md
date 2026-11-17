@@ -273,7 +273,10 @@ Postgres works; Vercel Postgres is the shortest path:
 
 1. In the Vercel project open **Storage → Create → Postgres** (or use Neon/Supabase).
 2. Copy the **pooled** connection string (contains `-pooler`) — serverless functions open
-   many short-lived connections, which the pooler is built for.
+   many short-lived connections, which the pooler is built for. The app keeps exactly one
+   connection per function instance and reuses it, so a sync batch costs one connect
+   instead of one per report, and N instances mean N connections for the pooler to
+   multiplex onto Postgres.
 3. Add it to the project's environment variables as `DATABASE_URL`.
 4. Optionally set `DETECT_RATE_LIMIT` (default `30/minute`) to tune how hard the public
    detection endpoint can be hit.
