@@ -8,16 +8,10 @@ Two jobs:
   offline reports to once the phone is back online. Reports are persisted through
   :mod:`airoad.store`, so they survive the instance that handled the upload.
 
-Both ``/reports`` routes require a bearer token (:mod:`airoad.auth`), because the
-stored reports contain GPS coordinates. Detection stays public but is rate limited
-per client (:mod:`airoad.ratelimit`), since every call spends CPU.
-
-Run it locally:
-
-    uvicorn airoad.api:app --host 0.0.0.0 --port 8000
-
-Inference itself never needs the network; this service only exists so phones can
-sync reports later.
+Both ``/reports`` routes require a per-driver bearer token (:mod:`airoad.auth`) and
+only ever touch that driver's reports, because the stored reports contain GPS
+coordinates. Detection stays public but is rate limited per client
+(:mod:`airoad.ratelimit`), since every call spends CPU.
 """
 
 from __future__ import annotations
@@ -40,8 +34,10 @@ from fastapi import (
 )
 from pydantic import BaseModel, Field
 
-from airoad.auth import require_sync_token
+from airoad.auth import require_driver
+from airoad.db import MAX_REPORT_ID_LENGTH, StorageNotConfigured
 from airoad.detector import OfflineDetectorFacade
+from airoad.drivers import Driver
 from airoad.limits import MAX_UPLOAD_BYTES, MAX_UPLOAD_MB, format_size
 from airoad.models import GeoLocation
 from airoad.ratelimit import (
@@ -50,15 +46,15 @@ from airoad.ratelimit import (
     client_key,
     get_limiter,
 )
-from airoad.store import ReportStore, StorageNotConfigured, get_store
+from airoad.store import ReportStore, get_store
 
 app = FastAPI(
     title="AI Road Detector",
-    version="0.2.0",
+    version="0.3.0",
     description=(
         "Sync and detection API for pothole / road-crack reports. "
-        "The /reports routes require an Authorization: Bearer <SYNC_API_TOKEN> header; "
-        "/detect is public but rate limited per client."
+        "The /reports routes require a per-driver "
+        "Authorization: Bearer <token> header; /detect is public but rate limited."
     ),
 )
 
@@ -68,21 +64,17 @@ _detector = OfflineDetectorFacade()
 class SyncedReport(BaseModel):
     """A report the phone queued while offline.
 
-    ``report_id`` is required because it is the storage key; any other field the
-    client sends (predictions, location, notes, ...) is stored verbatim.
+    ``report_id`` is required and capped at the column width, so an over-long id
+    is rejected with a 422 instead of failing inside the database.
     """
 
     model_config = {"extra": "allow"}
 
-    report_id: str = Field(min_length=1)
+    report_id: str = Field(min_length=1, max_length=MAX_REPORT_ID_LENGTH)
 
 
 def store_dependency() -> ReportStore:
-    """Injection point so tests can supply a throwaway database.
-
-    A deployment without a usable database answers 503 rather than failing every
-    request with a stack trace.
-    """
+    """Injection point so tests can supply a throwaway database."""
     try:
         return get_store()
     except StorageNotConfigured as exc:
@@ -212,13 +204,14 @@ async def detect(
     return payload
 
 
-@app.post("/reports", dependencies=[Depends(require_sync_token)])
+@app.post("/reports")
 def sync_reports(
     reports: List[SyncedReport],
+    driver: Driver = Depends(require_driver),
     store: ReportStore = Depends(store_dependency),
 ) -> dict:
-    """Accept reports the phone queued while offline."""
-    outcome = store.add_many([report.model_dump() for report in reports])
+    """Accept reports the phone queued while offline, for the calling driver."""
+    outcome = store.add_many(driver.driver_id, [report.model_dump() for report in reports])
     return {
         "accepted": outcome.received,
         "stored": outcome.stored,
@@ -227,10 +220,15 @@ def sync_reports(
     }
 
 
-@app.get("/reports", dependencies=[Depends(require_sync_token)])
+@app.get("/reports")
 def list_reports(
     limit: int = Query(50, ge=1, le=500),
+    driver: Driver = Depends(require_driver),
     store: ReportStore = Depends(store_dependency),
 ) -> dict:
-    """Reports already synced, newest first."""
-    return {"reports": store.list_reports(limit), "total_synced": store.count()}
+    """The calling driver's reports, newest first."""
+    return {
+        "driver_id": driver.driver_id,
+        "reports": store.list_reports(driver.driver_id, limit),
+        "total_synced": store.count(driver.driver_id),
+    }

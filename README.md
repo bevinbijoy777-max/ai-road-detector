@@ -10,7 +10,7 @@ The Python OOP core in `python/` is the same domain model: detector, reports and
 | --- | --- |
 | `python/airoad` domain models, detectors, CLI, FastAPI sync API | Implemented, tested |
 | Report persistence (`DATABASE_URL` → Postgres, SQLite for dev) | Implemented, tested |
-| Report routes behind a bearer token (`SYNC_API_TOKEN`, rotatable) | Implemented, tested |
+| Per-driver reports, hashed tokens, rotation (`python -m airoad.admin`) | Implemented, tested |
 | Rate limiting on `/detect` (`DETECT_RATE_LIMIT`, shared via `DATABASE_URL`) | Implemented, tested |
 | Tests + CI (`.github/workflows/python-tests.yml`) | Implemented, runs on push/PR |
 | Vercel deployment (`app.py` entrypoint, `.python-version`) | Configured, see [Deploying on Vercel](#deploying-on-vercel) |
@@ -111,8 +111,8 @@ From a plain checkout without installing: `cd python && PYTHONPATH=. uvicorn air
 | `POST /reports` 🔒 | Persists the reports the phone queued offline; returns `accepted` / `stored` / `skipped` / `total_synced` |
 | `GET /reports` 🔒 | Already-synced reports, newest first (`?limit=`, default 50) |
 
-🔒 requires an `Authorization: Bearer $SYNC_API_TOKEN` header — see
-[Protecting the report routes](#protecting-the-report-routes).
+🔒 requires a per-driver `Authorization: Bearer <token>` header — see
+[Drivers and per-driver authentication](#drivers-and-per-driver-authentication).
 
 Interactive docs are served at `http://localhost:8000/docs`.
 
@@ -127,38 +127,66 @@ configured by `DATABASE_URL`:
   Vercel a fallback file would silently lose data, so `/reports` answers **503** instead
   and `/health` reports `"durable_report_storage": false`.
 
-`report_id` is the table's primary key, so a phone retrying an upload after a dropped
-connection does not create duplicates: the repeat is reported in `skipped`.
+`report_id` is part of the primary key together with `driver_id`, so a phone retrying an
+upload after a dropped connection does not create duplicates (the repeat is reported in
+`skipped`), while two drivers can still use the same id.
 
-### Protecting the report routes
+**Upgrading an existing database:** `reports` gained a `driver_id` column and
+`create_all` does not alter existing tables. Earlier versions only ever held throwaway
+data, so the simplest fix is to drop the old table and let the API recreate it:
 
-Stored reports contain GPS coordinates, so both `/reports` routes require a shared
-bearer token from the `SYNC_API_TOKEN` environment variable:
+```sql
+DROP TABLE IF EXISTS reports;
+```
+
+### Drivers and per-driver authentication
+
+Reports contain GPS coordinates, so every report belongs to a driver and both `/reports`
+routes only ever touch the calling driver's reports. Each driver has their own bearer
+token; only a SHA-256 hash of it is stored, so a database leak hands out no credentials.
+
+Create a driver and get its first token:
 
 ```bash
-export SYNC_API_TOKEN=$(python -c "import secrets; print(secrets.token_urlsafe(32))")
+python -m airoad.admin create-driver "Asha"
+# driver_id: 47b7e19e10037084
+# name:      Asha
+# token:     0Yb...        (printed once - only its hash is kept)
+```
 
-curl -H "Authorization: Bearer $SYNC_API_TOKEN" http://localhost:8000/reports
-curl -X POST -H "Authorization: Bearer $SYNC_API_TOKEN" \
+```bash
+curl -H "Authorization: Bearer $TOKEN" http://localhost:8000/reports
+curl -X POST -H "Authorization: Bearer $TOKEN" \
      -H 'Content-Type: application/json' \
      -d '[{"report_id":"r1","synced":false}]' \
      http://localhost:8000/reports
 ```
 
-The token is compared in constant time, and every configured token is checked so the
-timing does not reveal which one matched. With `SYNC_API_TOKEN` unset the routes answer
-**503** rather than opening up — a missing secret closes them instead of exposing
-coordinates. A wrong or absent header gets **401**. `GET /health` and `GET /limits` stay
-public, and `POST /detect` stays public but rate limited (below).
+`GET /reports` echoes `driver_id` and counts only that driver's rows. A missing, unknown
+or revoked token gets **401**; a deployment without a database gets **503**. `/health`,
+`/limits` and `/detect` stay public (`/detect` is rate limited, below).
 
-#### Rotating the token
+| Command | Purpose |
+| --- | --- |
+| `python -m airoad.admin create-driver NAME` | Create a driver, print its first token |
+| `python -m airoad.admin add-token DRIVER_ID` | Issue another token for a driver |
+| `python -m airoad.admin list-drivers` | Drivers with their token counts |
+| `python -m airoad.admin revoke-token TOKEN` | Delete one token |
 
-`SYNC_API_TOKEN` accepts a comma-separated list, so you can replace it without breaking
-the phone's sync:
+The admin CLI reads `DATABASE_URL` like the API, so point it at the same database
+(`DATABASE_URL="postgresql://…" python -m airoad.admin create-driver "Asha"`).
 
-1. Deploy `SYNC_API_TOKEN=old-token,new-token` — both are accepted.
-2. Ship the phone build that sends `new-token`.
-3. Deploy `SYNC_API_TOKEN=new-token`; the old one now gets **401**.
+#### Rotating a driver token
+
+1. `add-token DRIVER_ID` — old and new tokens both work.
+2. Ship the phone build that uses the new token.
+3. `revoke-token OLD_TOKEN` — the old one now gets **401**.
+
+#### Length limits
+
+`report_id` is capped at 64 characters and the rate limiter's client key at 128, matching
+their columns, so an over-long value is a **422** (or a truncated key) instead of a
+database error on Postgres.
 
 ### Rate limiting
 
@@ -247,11 +275,12 @@ Postgres works; Vercel Postgres is the shortest path:
 2. Copy the **pooled** connection string (contains `-pooler`) — serverless functions open
    many short-lived connections, which the pooler is built for.
 3. Add it to the project's environment variables as `DATABASE_URL`.
-4. Add `SYNC_API_TOKEN` — a long random string, or a comma-separated list while
-   rotating — as an environment variable too. Without it both `/reports` routes answer
-   **503**.
-5. Optionally set `DETECT_RATE_LIMIT` (default `30/minute`) to tune how hard the public
+4. Optionally set `DETECT_RATE_LIMIT` (default `30/minute`) to tune how hard the public
    detection endpoint can be hit.
+5. Create a driver for each phone, against the deployed database:
+   `DATABASE_URL="postgresql://…" python -m airoad.admin create-driver "Asha"`.
+   There is no shared `SYNC_API_TOKEN` any more, so a deployment with no drivers simply
+   rejects syncs with 401.
 
 `DATABASE_URL` is required by both `/reports` (persistence) and `/detect` (the shared rate
 limit), so a deployment without it answers 503 on both.
@@ -271,7 +300,8 @@ database, not in the function's memory.
 | `BaseDetector` | Abstract detector |
 | `HeuristicDetector`, `TFLiteDetector` | On-device implementations (`airoad/detector.py`) |
 | `OfflineDetectorFacade` | Chooses a local model |
-| `ReportStore`, `SqlReportStore` | Report persistence (`airoad/store.py`) |
+| `ReportStore`, `SqlReportStore` | Report persistence, scoped per driver (`airoad/store.py`) |
+| `Driver`, `DriverStore`, `SqlDriverStore` | Drivers and hashed tokens (`airoad/drivers.py`) |
 | `MAX_UPLOAD_BYTES`, `check_upload_size`, `check_upload_file` | Upload limit helpers (`airoad/limits.py`) |
 
 ## Tests and CI
@@ -282,8 +312,9 @@ python -m pytest -q
 ```
 
 `conftest.py` puts `python/` on `sys.path`, so tests run from the repository root without installing the package. Coverage: domain models, detector behaviour (including failure modes), report persistence
-(including survival across a fresh store instance and duplicate suppression), upload limits,
-the FastAPI endpoints and the CLI.
+(survival across a fresh store instance, duplicate suppression, per-driver isolation),
+driver tokens and rotation, authentication, column-length caps, upload limits, the FastAPI
+endpoints and both CLIs.
 
 `.github/workflows/python-tests.yml` runs the suite on Python 3.10 and 3.12 for every push to `main` and every pull request, then smoke-tests the API and CLI imports. A second job runs the whole suite again against a `postgres:16-alpine` service container.
 

@@ -38,13 +38,17 @@ from sqlalchemy import (
     select,
 )
 
-from airoad.store import build_engine, resolve_database_url
+from airoad.db import build_engine, resolve_database_url
 
 RATE_LIMIT_ENV = "DETECT_RATE_LIMIT"
 DEFAULT_RATE_LIMIT = "30/minute"
 
 #: Forwarded headers are only trusted when a proxy is known to set them.
 TRUST_PROXY_ENV = "TRUST_PROXY_HEADERS"
+
+#: Longest stored client key (matches ``detect_attempts.client_key``). Callers are
+#: truncated to this so a bogus forwarded header cannot overflow the column.
+MAX_CLIENT_KEY_LENGTH = 128
 
 _UNITS: Dict[str, float] = {
     "s": 1.0,
@@ -64,7 +68,7 @@ metadata = MetaData()
 attempts_table = Table(
     "detect_attempts",
     metadata,
-    Column("client_key", String(128), nullable=False),
+    Column("client_key", String(MAX_CLIENT_KEY_LENGTH), nullable=False),
     Column("expires_at", Float, nullable=False),
     Index("ix_detect_attempts_key_expiry", "client_key", "expires_at"),
     Index("ix_detect_attempts_expiry", "expires_at"),
@@ -127,6 +131,7 @@ class SqlRateLimiter(RateLimiter):
         metadata.create_all(engine)
 
     def check(self, key: str) -> RateLimitDecision:
+        key = key[:MAX_CLIENT_KEY_LENGTH]
         now = self._clock()
         with self._engine.begin() as connection:
             # Expired attempts are cleared before counting, which also bounds the
@@ -219,6 +224,12 @@ def get_limiter() -> RateLimiter:
 
 
 def client_key(request: Request) -> str:
+    """Caller identity, capped at :data:`MAX_CLIENT_KEY_LENGTH` for storage."""
+
+    return _raw_client_key(request)[:MAX_CLIENT_KEY_LENGTH]
+
+
+def _raw_client_key(request: Request) -> str:
     """Identify the caller for rate limiting.
 
     Forwarded headers are only honoured when a proxy is known to set them,

@@ -4,8 +4,10 @@ import pytest
 from sqlalchemy import func, select
 from starlette.requests import Request
 
+from airoad.db import StorageNotConfigured, build_engine
 from airoad.ratelimit import (
     DEFAULT_RATE_LIMIT,
+    MAX_CLIENT_KEY_LENGTH,
     RATE_LIMIT_ENV,
     NoopLimiter,
     RateLimitMisconfigured,
@@ -15,7 +17,6 @@ from airoad.ratelimit import (
     create_limiter,
     parse_rate_limit,
 )
-from airoad.store import StorageNotConfigured, build_engine
 
 
 class FakeClock:
@@ -242,3 +243,26 @@ def test_client_key_handles_a_missing_peer_address(monkeypatch):
     monkeypatch.delenv("VERCEL", raising=False)
     monkeypatch.delenv("TRUST_PROXY_HEADERS", raising=False)
     assert client_key(make_request(client=None)) == "unknown"
+
+
+# --- column-length safety ---------------------------------------------------
+
+
+def test_client_key_is_capped_to_the_column_length(monkeypatch):
+    monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
+    bogus = "9" * 500
+    key = client_key(make_request({"X-Forwarded-For": bogus}))
+
+    assert len(key) == MAX_CLIENT_KEY_LENGTH
+    assert key == bogus[:MAX_CLIENT_KEY_LENGTH]
+
+
+def test_an_overlong_client_key_does_not_break_the_limiter(database_url):
+    """Postgres rejects a value wider than the column, so the limiter caps it."""
+    limiter = build_limiter(database_url, limit=1)
+    overlong = "x" * 500
+
+    assert limiter.check(overlong).allowed
+    # Capped keys that share a prefix share one bucket, which is stricter.
+    assert limiter.check(overlong).allowed is False
+    assert limiter.check("x" * MAX_CLIENT_KEY_LENGTH).allowed is False
