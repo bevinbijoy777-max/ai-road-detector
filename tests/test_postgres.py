@@ -2,7 +2,8 @@
 
 Skipped unless ``TEST_DATABASE_URL`` points at a scratch Postgres, which is what
 the CI Postgres job and the README's Postgres command set. SQLite cannot show
-this: it has no server sessions and pools differently.
+this: it has no server sessions and pools differently, so a SQLite URL skips
+here too rather than failing the pool-size assertion further down.
 
 Use a scratch database - the fixtures empty its tables.
 """
@@ -11,15 +12,31 @@ import os
 
 import pytest
 from sqlalchemy import event
+from sqlalchemy.engine import make_url
+from sqlalchemy.exc import ArgumentError
 
 from airoad.db import get_engine
 from airoad.drivers import create_driver_store
 from airoad.ratelimit import create_limiter
 from airoad.store import create_store
 
+TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL", "")
+
+
+def points_at_postgres(database_url: str) -> bool:
+    """SQLite is a valid ``TEST_DATABASE_URL`` for the rest of the suite, not here."""
+    try:
+        return make_url(database_url).get_backend_name() in {"postgresql", "postgres"}
+    except ArgumentError:
+        return False
+
+
 pytestmark = pytest.mark.skipif(
-    not os.environ.get("TEST_DATABASE_URL"),
-    reason="set TEST_DATABASE_URL to a scratch Postgres to run this",
+    not points_at_postgres(TEST_DATABASE_URL),
+    reason=(
+        "TEST_DATABASE_URL must point at a scratch Postgres; "
+        "see 'Verifying against Postgres' in README.md"
+    ),
 )
 
 
