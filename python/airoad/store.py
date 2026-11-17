@@ -29,7 +29,7 @@ from sqlalchemy import (
     insert,
     select,
 )
-from sqlalchemy.engine import Engine
+from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.exc import IntegrityError
 
 from airoad.db import (
@@ -91,30 +91,41 @@ class SqlReportStore(ReportStore):
     def add_many(
         self, driver_id: str, reports: Sequence[Dict[str, Any]]
     ) -> SyncOutcome:
+        """Store a whole batch in one transaction, skipping ids already stored."""
+        if not reports:
+            return SyncOutcome(
+                received=0, stored=0, skipped=0, total=self.count(driver_id)
+            )
+
         stored = 0
         skipped = 0
-        for report in reports:
-            record = {**report, "synced": True}
-            try:
-                with self._engine.begin() as connection:
-                    connection.execute(
-                        insert(reports_table).values(
-                            report_id=str(record["report_id"]),
-                            driver_id=driver_id,
-                            synced=True,
-                            payload=json.dumps(record),
-                            received_at=datetime.now(timezone.utc),
+        # One transaction for the batch: an upload lands completely or not at
+        # all, and the batch costs its instance's single connection one checkout.
+        with self._engine.begin() as connection:
+            for report in reports:
+                record = {**report, "synced": True}
+                try:
+                    # Each row gets its own SAVEPOINT. On Postgres a primary-key
+                    # collision aborts the whole transaction unless it is undone
+                    # to a savepoint, so without this one duplicate id would fail
+                    # the entire batch instead of being skipped.
+                    with connection.begin_nested():
+                        connection.execute(
+                            insert(reports_table).values(
+                                report_id=str(record["report_id"]),
+                                driver_id=driver_id,
+                                synced=True,
+                                payload=json.dumps(record),
+                                received_at=datetime.now(timezone.utc),
+                            )
                         )
-                    )
-                stored += 1
-            except IntegrityError:
-                # Already synced by an earlier retry - not an error.
-                skipped += 1
+                    stored += 1
+                except IntegrityError:
+                    # Already synced by an earlier retry - not an error.
+                    skipped += 1
+            total = self._count(connection, driver_id)
         return SyncOutcome(
-            received=len(reports),
-            stored=stored,
-            skipped=skipped,
-            total=self.count(driver_id),
+            received=len(reports), stored=stored, skipped=skipped, total=total
         )
 
     def list_reports(self, driver_id: str, limit: int = 50) -> List[Dict[str, Any]]:
@@ -128,13 +139,17 @@ class SqlReportStore(ReportStore):
             return [json.loads(row.payload) for row in connection.execute(statement)]
 
     def count(self, driver_id: str) -> int:
+        with self._engine.connect() as connection:
+            return self._count(connection, driver_id)
+
+    @staticmethod
+    def _count(connection: Connection, driver_id: str) -> int:
         statement = (
             select(func.count())
             .select_from(reports_table)
             .where(reports_table.c.driver_id == driver_id)
         )
-        with self._engine.connect() as connection:
-            return int(connection.execute(statement).scalar_one())
+        return int(connection.execute(statement).scalar_one())
 
 
 def create_store(database_url=None) -> ReportStore:

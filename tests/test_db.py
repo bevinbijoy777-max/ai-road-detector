@@ -16,6 +16,7 @@ from airoad.db import (
     POOL_TIMEOUT_SECONDS,
     POSTGRES_POOL_SIZE,
     build_engine,
+    disable_prepared_statements,
 )
 from airoad.store import SqlReportStore
 
@@ -26,6 +27,8 @@ POOLED_URLS = [
     "postgresql+psycopg://user:pass@ep-cool-name-123456-pooler.us-east-2.aws.neon.tech/neondb",
     "postgresql://default:pass@ep-cool-name-123456-pooler.us-east-1.postgres.vercel-storage.com/verceldb",
     "postgresql://postgres.abcdefgh:pass@aws-0-us-east-1.pooler.supabase.com:6543/postgres",
+    # Transaction mode on a host that does not (or no longer) says "pooler".
+    "postgresql://postgres:pass@db.internal.example.com:6543/postgres",
 ]
 
 DIRECT_URLS = [
@@ -99,3 +102,36 @@ def test_sqlite_fallback_keeps_sharing_connections_between_threads(tmp_path):
             assert connection.exec_driver_sql("select 1").scalar_one() == 1
     finally:
         engine.dispose()
+
+
+# --- prepared statements ---------------------------------------------------
+
+
+@pytest.mark.parametrize("url", POOLED_URLS + DIRECT_URLS)
+def test_every_postgres_engine_disables_prepared_statements(url):
+    """A prepared statement cannot outlive the session it was created in."""
+    engine = build_engine(url)
+    try:
+        assert event.contains(engine, "connect", disable_prepared_statements)
+    finally:
+        engine.dispose()
+
+
+def test_disable_prepared_statements_clears_the_psycopg_threshold():
+    class Psycopg3Connection:
+        prepare_threshold = 5
+
+    connection = Psycopg3Connection()
+    disable_prepared_statements(connection, None)
+    assert connection.prepare_threshold is None
+
+
+def test_disable_prepared_statements_ignores_other_dbapis():
+    """psycopg2 and non-Postgres drivers have no such attribute - do not raise."""
+
+    class OtherConnection:
+        pass
+
+    connection = OtherConnection()
+    disable_prepared_statements(connection, None)
+    assert not hasattr(connection, "prepare_threshold")

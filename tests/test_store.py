@@ -7,8 +7,9 @@ dialect-specific SQL.
 """
 
 import pytest
+from sqlalchemy import event
 
-from airoad.db import DEFAULT_SQLITE_URL, StorageNotConfigured
+from airoad.db import DEFAULT_SQLITE_URL, StorageNotConfigured, build_engine
 from airoad.store import SqlReportStore, create_store
 
 DRIVER = "driver-1"
@@ -128,4 +129,50 @@ def test_local_default_falls_back_to_sqlite(monkeypatch, tmp_path):
 def test_explicit_url_wins_over_the_environment(monkeypatch, database_url):
     monkeypatch.setenv("DATABASE_URL", "sqlite:///somewhere-else.db")
     store = create_store(database_url)
+    assert store.count(DRIVER) == 0
+
+
+# --- one transaction per batch ----------------------------------------------
+
+
+def test_a_batch_is_written_in_a_single_transaction(database_url):
+    """Five reports must not mean five transactions on the instance's connection."""
+    engine = build_engine(database_url)
+    try:
+        store = SqlReportStore(engine)  # creates its tables first
+        begins = []
+        event.listen(engine, "begin", lambda *args: begins.append(1))
+
+        store.add_many(DRIVER, [{"report_id": f"r{i}"} for i in range(5)])
+
+        # Checked before store.count(), which opens a transaction of its own.
+        assert len(begins) == 1
+        assert store.count(DRIVER) == 5
+    finally:
+        engine.dispose()
+
+
+def test_duplicates_inside_one_batch_are_skipped_not_fatal(database_url):
+    """A savepoint per row keeps one collision from aborting the transaction."""
+    store = create_store(database_url)
+
+    outcome = store.add_many(
+        DRIVER,
+        [{"report_id": "same"}, {"report_id": "same"}, {"report_id": "fresh"}],
+    )
+
+    assert (outcome.received, outcome.stored, outcome.skipped) == (3, 2, 1)
+    assert outcome.total == 2
+    assert store.count(DRIVER) == 2
+
+
+def test_a_failed_batch_stores_nothing(database_url):
+    """All or nothing: a report that cannot be serialised rolls the batch back."""
+    store = create_store(database_url)
+
+    with pytest.raises(TypeError):
+        store.add_many(
+            DRIVER, [{"report_id": "would-be-stored"}, {"report_id": "bad", "x": object()}]
+        )
+
     assert store.count(DRIVER) == 0

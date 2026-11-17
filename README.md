@@ -276,7 +276,10 @@ Postgres works; Vercel Postgres is the shortest path:
    many short-lived connections, which the pooler is built for. The app keeps exactly one
    connection per function instance and reuses it, so a sync batch costs one connect
    instead of one per report, and N instances mean N connections for the pooler to
-   multiplex onto Postgres.
+   multiplex onto Postgres. psycopg's server-side prepared statements are switched off on
+   every Postgres connection (`prepare_threshold = None`): a prepared statement only
+   exists in one Postgres session, and a transaction-mode pooler gives each transaction a
+   different one.
 3. Add it to the project's environment variables as `DATABASE_URL`.
 4. Optionally set `DETECT_RATE_LIMIT` (default `30/minute`) to tune how hard the public
    detection endpoint can be hit.
