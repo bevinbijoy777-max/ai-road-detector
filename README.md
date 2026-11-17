@@ -236,6 +236,9 @@ Installing the package (`pip install .`, or `pip install -e .` for development) 
 
 ## Deploying on Vercel
 
+Step-by-step runbook, including the CLI commands, environment variables, driver-token
+creation and a smoke test: [DEPLOY.md](DEPLOY.md).
+
 `app.py` in the repository root is the Vercel entrypoint. Vercel's FastAPI preset looks
 for a module-level `app`, and the real application lives in `python/airoad/api.py`, so
 `app.py` puts that source root on `sys.path` and re-exports it. No `vercel.json`,
