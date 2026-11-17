@@ -41,12 +41,22 @@ source .venv/bin/activate
 # Windows
 .venv\Scripts\activate
 
+pip install -e ".[dev]"   # installs the package + runtime deps + pytest
+# ...or just the runtime dependencies, running straight from the source tree:
 pip install -r requirements.txt
 ```
 
+`pip install -e .` puts `airoad` on the path, so none of the commands below need `PYTHONPATH`.
+
 ### CLI — offline detection
 
-From the repository root:
+With the package installed (`pip install -e .`), from anywhere:
+
+```bash
+airoad path/to/road.jpg --lat 12.9716 --lng 77.5946
+```
+
+Running from a plain checkout instead, from the repository root:
 
 ```bash
 PYTHONPATH=python python -m airoad path/to/road.jpg --lat 12.9716 --lng 77.5946
@@ -74,9 +84,10 @@ Primary:  Pothole (100%)
 ### Sync API
 
 ```bash
-cd python
-PYTHONPATH=. uvicorn airoad.api:app --host 0.0.0.0 --port 8000
+uvicorn airoad.api:app --host 0.0.0.0 --port 8000
 ```
+
+From a plain checkout without installing: `cd python && PYTHONPATH=. uvicorn airoad.api:app --port 8000`.
 
 | Endpoint | Purpose |
 | --- | --- |
@@ -95,11 +106,13 @@ Point the Android worker URL (`ReportSyncWorker.DEFAULT_URL`) at your PC's LAN I
 The app is a standard ASGI application, so any host that runs `uvicorn` works:
 
 ```bash
-pip install -r requirements.txt
+pip install .
 uvicorn airoad.api:app --host 0.0.0.0 --port ${PORT:-8000}
 ```
 
-Run it from the `python/` directory, or set `PYTHONPATH=python` from the root.
+Installing the package (`pip install .`, or `pip install -e .` for development) makes
+`airoad` importable, so no `PYTHONPATH` is needed. Dependencies are read from
+`requirements.txt` via `pyproject.toml`, so there is one list to maintain.
 
 ## OOP layout
 
