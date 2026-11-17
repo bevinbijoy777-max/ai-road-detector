@@ -15,7 +15,7 @@ import os
 import pytest
 from sqlalchemy import delete
 
-from airoad.db import build_engine, dispose_engines
+from airoad.db import dispose_engines, get_engine
 from airoad.drivers import drivers_table, driver_tokens_table, metadata as driver_metadata
 from airoad.ratelimit import attempts_table, metadata as rate_limit_metadata
 from airoad.store import metadata as store_metadata, reports_table
@@ -29,19 +29,20 @@ def shared_database_url() -> str | None:
 
 
 def reset_shared_database(url: str) -> None:
-    """Create the tables if needed and empty them so each test starts clean."""
-    engine = build_engine(url)
-    try:
-        store_metadata.create_all(engine)
-        driver_metadata.create_all(engine)
-        rate_limit_metadata.create_all(engine)
-        with engine.begin() as connection:
-            connection.execute(delete(reports_table))
-            connection.execute(delete(driver_tokens_table))
-            connection.execute(delete(drivers_table))
-            connection.execute(delete(attempts_table))
-    finally:
-        engine.dispose()
+    """Create the tables if needed and empty them so each test starts clean.
+
+    Uses the shared engine, so a Postgres run reuses one connection instead of
+    opening and closing a second engine per test.
+    """
+    engine = get_engine(url)
+    store_metadata.create_all(engine)
+    driver_metadata.create_all(engine)
+    rate_limit_metadata.create_all(engine)
+    with engine.begin() as connection:
+        connection.execute(delete(reports_table))
+        connection.execute(delete(driver_tokens_table))
+        connection.execute(delete(drivers_table))
+        connection.execute(delete(attempts_table))
 
 
 @pytest.fixture

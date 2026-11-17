@@ -7,6 +7,8 @@ opens a Postgres socket: ``create_engine`` resolves the dialect and pool without
 connecting, and reuse is asserted against a local SQLite engine instead.
 """
 
+import threading
+
 import pytest
 from sqlalchemy import event
 from sqlalchemy.pool import QueuePool
@@ -143,19 +145,32 @@ def test_disable_prepared_statements_ignores_other_dbapis():
 # --- one engine per DATABASE_URL --------------------------------------------
 
 
-def test_store_limiter_and_driver_store_share_one_engine(database_url):
+def test_components_share_one_cached_engine_per_url(tmp_path):
     """Three components, one connection: they must not each pool their own."""
-    store = create_store(database_url)
-    limiter = create_limiter("30/minute", database_url)
-    drivers = create_driver_store(database_url)
+    url = f"sqlite:///{tmp_path / 'shared.db'}"
+    store = create_store(url)
+    limiter = create_limiter("30/minute", url)
+    drivers = create_driver_store(url)
 
-    shared = get_engine(database_url)
+    shared = get_engine(url)
     assert store._engine is shared
     assert limiter._engine is shared
     assert drivers._engine is shared
+    # Cached per URL, not globally.
+    assert get_engine(f"sqlite:///{tmp_path / 'other.db'}") is not shared
 
 
-def test_the_shared_engine_is_cached_per_url(tmp_path):
-    first = get_engine(f"sqlite:///{tmp_path / 'a.db'}")
-    assert get_engine(f"sqlite:///{tmp_path / 'a.db'}") is first
-    assert get_engine(f"sqlite:///{tmp_path / 'b.db'}") is not first
+def test_concurrent_callers_all_get_the_one_engine(database_url):
+    """A cold-start race must not leave an instance holding a second engine."""
+    engines = []
+    threads = [
+        threading.Thread(target=lambda: engines.append(get_engine(database_url)))
+        for _ in range(16)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert len(engines) == len(threads)
+    assert len({id(engine) for engine in engines}) == 1

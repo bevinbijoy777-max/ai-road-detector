@@ -21,7 +21,6 @@ different session.
 from __future__ import annotations
 
 import os
-from threading import Lock
 from typing import Dict, Optional
 
 from sqlalchemy import create_engine, event
@@ -114,7 +113,6 @@ def build_engine(database_url: str) -> Engine:
 
 #: One engine per resolved database URL, shared by every component in the process.
 _engines: Dict[str, Engine] = {}
-_engines_lock = Lock()
 
 
 def get_engine(database_url: Optional[str] = None) -> Engine:
@@ -126,23 +124,18 @@ def get_engine(database_url: Optional[str] = None) -> Engine:
     """
     url = resolve_database_url(database_url)
     engine = _engines.get(url)
-    if engine is not None:
-        return engine
-
-    with _engines_lock:
-        # Another thread may have built it while this one waited for the lock.
-        engine = _engines.get(url)
-        if engine is None:
-            engine = build_engine(url)
-            _engines[url] = engine
+    if engine is None:
+        # setdefault is atomic, so threads racing on a cold start all receive the
+        # one engine that won. A loser builds an engine but never opens a
+        # connection with it, so nothing is leaked beyond the object itself.
+        engine = _engines.setdefault(url, build_engine(url))
     return engine
 
 
 def dispose_engines() -> None:
     """Close and forget the shared engines (tests, and forking workers)."""
-    with _engines_lock:
-        engines = list(_engines.values())
-        _engines.clear()
+    engines = list(_engines.values())
+    _engines.clear()
     for engine in engines:
         engine.dispose()
 
