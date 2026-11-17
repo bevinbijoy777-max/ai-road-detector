@@ -8,7 +8,9 @@ rejected with a 422 before Postgres ever sees it.
 Serverless deployments are connection-hungry: every function instance builds its
 own engine, and SQLAlchemy's default pool would let each one hold up to fifteen
 Postgres connections. :func:`build_engine` keeps the per-instance footprint to a
-single connection, held open and reused for the instance's lifetime.
+single connection, held open and reused for the instance's lifetime, and
+:func:`get_engine` caches that engine per URL so the report store, rate limiter
+and driver store share it instead of pooling three connections of their own.
 
 Every Postgres connection also has psycopg 3's server-side prepared statements
 switched off: they exist only inside one Postgres session, and a transaction-mode
@@ -19,7 +21,8 @@ different session.
 from __future__ import annotations
 
 import os
-from typing import Optional
+from threading import Lock
+from typing import Dict, Optional
 
 from sqlalchemy import create_engine, event
 from sqlalchemy.engine import Engine
@@ -107,6 +110,41 @@ def build_engine(database_url: str) -> Engine:
     event.listen(engine, "connect", disable_prepared_statements)
 
     return engine
+
+
+#: One engine per resolved database URL, shared by every component in the process.
+_engines: Dict[str, Engine] = {}
+_engines_lock = Lock()
+
+
+def get_engine(database_url: Optional[str] = None) -> Engine:
+    """The shared engine for a URL, built once and reused by every caller.
+
+    The API needs a report store, a rate limiter and a driver store. Building an
+    engine for each would hold one connection per component; keyed by the
+    resolved URL, they all pool from the same engine instead.
+    """
+    url = resolve_database_url(database_url)
+    engine = _engines.get(url)
+    if engine is not None:
+        return engine
+
+    with _engines_lock:
+        # Another thread may have built it while this one waited for the lock.
+        engine = _engines.get(url)
+        if engine is None:
+            engine = build_engine(url)
+            _engines[url] = engine
+    return engine
+
+
+def dispose_engines() -> None:
+    """Close and forget the shared engines (tests, and forking workers)."""
+    with _engines_lock:
+        engines = list(_engines.values())
+        _engines.clear()
+    for engine in engines:
+        engine.dispose()
 
 
 def resolve_database_url(database_url: Optional[str] = None) -> str:

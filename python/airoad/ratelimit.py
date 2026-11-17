@@ -38,7 +38,7 @@ from sqlalchemy import (
     select,
 )
 
-from airoad.db import build_engine, resolve_database_url
+from airoad.db import get_engine
 
 RATE_LIMIT_ENV = "DETECT_RATE_LIMIT"
 DEFAULT_RATE_LIMIT = "30/minute"
@@ -212,9 +212,8 @@ def create_limiter(
     limit, window = parse_rate_limit(raw)
     if limit == 0:
         return NoopLimiter()
-    return SqlRateLimiter(
-        build_engine(resolve_database_url(database_url)), limit, window
-    )
+    # The shared engine: the report and driver stores use this same connection.
+    return SqlRateLimiter(get_engine(database_url), limit, window)
 
 
 @lru_cache(maxsize=1)

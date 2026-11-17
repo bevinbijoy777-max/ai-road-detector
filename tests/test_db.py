@@ -17,8 +17,11 @@ from airoad.db import (
     POSTGRES_POOL_SIZE,
     build_engine,
     disable_prepared_statements,
+    get_engine,
 )
-from airoad.store import SqlReportStore
+from airoad.drivers import create_driver_store
+from airoad.ratelimit import create_limiter
+from airoad.store import SqlReportStore, create_store
 
 #: Pooled and direct URLs in the shapes the providers hand out. No credentials,
 #: and no connection is ever made.
@@ -135,3 +138,24 @@ def test_disable_prepared_statements_ignores_other_dbapis():
     connection = OtherConnection()
     disable_prepared_statements(connection, None)
     assert not hasattr(connection, "prepare_threshold")
+
+
+# --- one engine per DATABASE_URL --------------------------------------------
+
+
+def test_store_limiter_and_driver_store_share_one_engine(database_url):
+    """Three components, one connection: they must not each pool their own."""
+    store = create_store(database_url)
+    limiter = create_limiter("30/minute", database_url)
+    drivers = create_driver_store(database_url)
+
+    shared = get_engine(database_url)
+    assert store._engine is shared
+    assert limiter._engine is shared
+    assert drivers._engine is shared
+
+
+def test_the_shared_engine_is_cached_per_url(tmp_path):
+    first = get_engine(f"sqlite:///{tmp_path / 'a.db'}")
+    assert get_engine(f"sqlite:///{tmp_path / 'a.db'}") is first
+    assert get_engine(f"sqlite:///{tmp_path / 'b.db'}") is not first

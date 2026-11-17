@@ -32,12 +32,7 @@ from sqlalchemy import (
 from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.exc import IntegrityError
 
-from airoad.db import (
-    MAX_DRIVER_ID_LENGTH,
-    MAX_REPORT_ID_LENGTH,
-    build_engine,
-    resolve_database_url,
-)
+from airoad.db import MAX_DRIVER_ID_LENGTH, MAX_REPORT_ID_LENGTH, get_engine
 
 metadata = MetaData()
 
@@ -153,8 +148,12 @@ class SqlReportStore(ReportStore):
 
 
 def create_store(database_url=None) -> ReportStore:
-    """Build a store from an explicit URL or the environment."""
-    return SqlReportStore(build_engine(resolve_database_url(database_url)))
+    """Build a store from an explicit URL or the environment.
+
+    Uses the process-wide engine for that URL, so the rate limiter and driver
+    store share its connection rather than opening their own.
+    """
+    return SqlReportStore(get_engine(database_url))
 
 
 @lru_cache(maxsize=1)

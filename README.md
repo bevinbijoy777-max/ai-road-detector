@@ -273,8 +273,9 @@ Postgres works; Vercel Postgres is the shortest path:
 
 1. In the Vercel project open **Storage → Create → Postgres** (or use Neon/Supabase).
 2. Copy the **pooled** connection string (contains `-pooler`) — serverless functions open
-   many short-lived connections, which the pooler is built for. The app keeps exactly one
-   connection per function instance and reuses it, so a sync batch costs one connect
+   many short-lived connections, which the pooler is built for. The report store, rate
+   limiter and driver store share one cached engine per `DATABASE_URL`, so a function
+   instance holds exactly one connection and reuses it: a sync batch costs one connect
    instead of one per report, and N instances mean N connections for the pooler to
    multiplex onto Postgres. psycopg's server-side prepared statements are switched off on
    every Postgres connection (`prepare_threshold = None`): a prepared statement only

@@ -15,7 +15,7 @@ import os
 import pytest
 from sqlalchemy import delete
 
-from airoad.db import build_engine
+from airoad.db import build_engine, dispose_engines
 from airoad.drivers import drivers_table, driver_tokens_table, metadata as driver_metadata
 from airoad.ratelimit import attempts_table, metadata as rate_limit_metadata
 from airoad.store import metadata as store_metadata, reports_table
@@ -52,6 +52,13 @@ def database_url(tmp_path):
         reset_shared_database(shared)
         return shared
     return f"sqlite:///{tmp_path / 'test.db'}"
+
+
+@pytest.fixture(autouse=True)
+def _reset_shared_engines():
+    """The shared engine cache is process-wide; do not leak engines between tests."""
+    yield
+    dispose_engines()
 
 
 def pytest_report_header(config):

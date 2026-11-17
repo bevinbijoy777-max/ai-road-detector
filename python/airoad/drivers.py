@@ -32,7 +32,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.engine import Engine
 
-from airoad.db import MAX_DRIVER_ID_LENGTH, build_engine, resolve_database_url
+from airoad.db import MAX_DRIVER_ID_LENGTH, get_engine
 
 MAX_DRIVER_NAME_LENGTH = 80
 
@@ -203,7 +203,8 @@ class SqlDriverStore(DriverStore):
 
 
 def create_driver_store(database_url=None) -> DriverStore:
-    return SqlDriverStore(build_engine(resolve_database_url(database_url)))
+    """Uses the process-wide engine for that URL, shared with the other stores."""
+    return SqlDriverStore(get_engine(database_url))
 
 
 @lru_cache(maxsize=1)
