@@ -8,6 +8,9 @@ Two jobs:
   offline reports to once the phone is back online. Reports are persisted through
   :mod:`airoad.store`, so they survive the instance that handled the upload.
 
+Both ``/reports`` routes require a bearer token (:mod:`airoad.auth`), because the
+stored reports contain GPS coordinates. Detection and health checks stay public.
+
 Run it locally:
 
     uvicorn airoad.api:app --host 0.0.0.0 --port 8000
@@ -26,6 +29,7 @@ from typing import List, Optional
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile
 from pydantic import BaseModel, Field
 
+from airoad.auth import require_sync_token
 from airoad.detector import OfflineDetectorFacade
 from airoad.limits import MAX_UPLOAD_BYTES, MAX_UPLOAD_MB, format_size
 from airoad.models import GeoLocation
@@ -34,7 +38,10 @@ from airoad.store import ReportStore, StorageNotConfigured, get_store
 app = FastAPI(
     title="AI Road Detector",
     version="0.2.0",
-    description="Sync and detection API for pothole / road-crack reports.",
+    description=(
+        "Sync and detection API for pothole / road-crack reports. "
+        "The /reports routes require an Authorization: Bearer <SYNC_API_TOKEN> header."
+    ),
 )
 
 _detector = OfflineDetectorFacade()
@@ -161,7 +168,7 @@ async def detect(
     return payload
 
 
-@app.post("/reports")
+@app.post("/reports", dependencies=[Depends(require_sync_token)])
 def sync_reports(
     reports: List[SyncedReport],
     store: ReportStore = Depends(store_dependency),
@@ -176,7 +183,7 @@ def sync_reports(
     }
 
 
-@app.get("/reports")
+@app.get("/reports", dependencies=[Depends(require_sync_token)])
 def list_reports(
     limit: int = Query(50, ge=1, le=500),
     store: ReportStore = Depends(store_dependency),

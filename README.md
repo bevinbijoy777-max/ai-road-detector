@@ -10,6 +10,7 @@ The Python OOP core in `python/` is the same domain model: detector, reports and
 | --- | --- |
 | `python/airoad` domain models, detectors, CLI, FastAPI sync API | Implemented, tested |
 | Report persistence (`DATABASE_URL` → Postgres, SQLite for dev) | Implemented, tested |
+| Report routes behind a bearer token (`SYNC_API_TOKEN`) | Implemented, tested |
 | Tests + CI (`.github/workflows/python-tests.yml`) | Implemented, runs on push/PR |
 | Vercel deployment (`app.py` entrypoint, `.python-version`) | Configured, see [Deploying on Vercel](#deploying-on-vercel) |
 | Android app (`android/`) — screens, `OnDeviceDetector`, Room store, `ReportSyncWorker`, Maps view | **Not in this repository yet** |
@@ -106,8 +107,11 @@ From a plain checkout without installing: `cd python && PYTHONPATH=. uvicorn air
 | `GET /health` | Liveness probe; reports the active model and whether durable report storage is configured |
 | `GET /limits` | Upload size cap a client should check before sending a photo |
 | `POST /detect` | Multipart `image` plus optional `latitude`/`longitude` form fields → detection result JSON; **413** with the limit when the photo is too large |
-| `POST /reports` | Persists the reports the phone queued offline; returns `accepted` / `stored` / `skipped` / `total_synced` |
-| `GET /reports` | Already-synced reports, newest first (`?limit=`, default 50) |
+| `POST /reports` 🔒 | Persists the reports the phone queued offline; returns `accepted` / `stored` / `skipped` / `total_synced` |
+| `GET /reports` 🔒 | Already-synced reports, newest first (`?limit=`, default 50) |
+
+🔒 requires an `Authorization: Bearer $SYNC_API_TOKEN` header — see
+[Protecting the report routes](#protecting-the-report-routes).
 
 Interactive docs are served at `http://localhost:8000/docs`.
 
@@ -124,6 +128,26 @@ configured by `DATABASE_URL`:
 
 `report_id` is the table's primary key, so a phone retrying an upload after a dropped
 connection does not create duplicates: the repeat is reported in `skipped`.
+
+### Protecting the report routes
+
+Stored reports contain GPS coordinates, so both `/reports` routes require a shared
+bearer token from the `SYNC_API_TOKEN` environment variable:
+
+```bash
+export SYNC_API_TOKEN=$(python -c "import secrets; print(secrets.token_urlsafe(32))")
+
+curl -H "Authorization: Bearer $SYNC_API_TOKEN" http://localhost:8000/reports
+curl -X POST -H "Authorization: Bearer $SYNC_API_TOKEN" \
+     -H 'Content-Type: application/json' \
+     -d '[{"report_id":"r1","synced":false}]' \
+     http://localhost:8000/reports
+```
+
+The token is compared in constant time. With `SYNC_API_TOKEN` unset the routes answer
+**503** rather than opening up — a missing secret closes them instead of exposing
+coordinates. A wrong or absent header gets **401**. `GET /health`, `GET /limits` and
+`POST /detect` stay public.
 
 Point the Android worker URL (`ReportSyncWorker.DEFAULT_URL`) at your PC's LAN IP if you run this server.
 
@@ -180,7 +204,12 @@ Postgres works; Vercel Postgres is the shortest path:
 1. In the Vercel project open **Storage → Create → Postgres** (or use Neon/Supabase).
 2. Copy the **pooled** connection string (contains `-pooler`) — serverless functions open
    many short-lived connections, which the pooler is built for.
-3. Add it to the project's environment variables as `DATABASE_URL` and redeploy.
+3. Add it to the project's environment variables as `DATABASE_URL`.
+4. Add `SYNC_API_TOKEN` — a long random string — as an environment variable too.
+   Without it both `/reports` routes answer **503**.
+
+Redeploy after adding either variable, since environment changes only reach new
+function instances.
 
 `GET /health` then reports `"durable_report_storage": true`, and the `reports` table is
 created on the first upload. Reports outlive individual instances because they are in the

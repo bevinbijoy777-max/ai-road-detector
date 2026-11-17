@@ -8,15 +8,20 @@ from fastapi.testclient import TestClient
 from PIL import Image
 
 from airoad.api import app, store_dependency
+from airoad.auth import SYNC_TOKEN_ENV
 from airoad.limits import MAX_UPLOAD_BYTES
 from airoad.store import create_store
+
+SYNC_TOKEN = "test-token-123"
+AUTH = {"Authorization": f"Bearer {SYNC_TOKEN}"}
 
 client = TestClient(app)
 
 
 @pytest.fixture(autouse=True)
-def temp_store(tmp_path):
-    """Give every test its own database instead of the process-wide one."""
+def configured(monkeypatch, tmp_path):
+    """A configured token and a throwaway database for every test."""
+    monkeypatch.setenv(SYNC_TOKEN_ENV, SYNC_TOKEN)
     store = create_store(f"sqlite:///{tmp_path / 'reports.db'}")
     app.dependency_overrides[store_dependency] = lambda: store
     yield store
@@ -103,8 +108,8 @@ def test_detect_rejects_an_oversized_photo_with_413():
 
 
 def test_detect_accepts_a_photo_at_exactly_the_limit():
-    # A single-byte-over-limit file is rejected; one byte under must get through
-    # to decoding, which then fails cleanly as an unreadable image.
+    # One byte over is rejected; one byte under must reach decoding, which then
+    # fails cleanly as an unreadable image.
     not_an_image = b"\0" * (MAX_UPLOAD_BYTES - 1)
     response = client.post(
         "/detect", files={"image": ("big.png", not_an_image, "image/png")}
@@ -131,12 +136,70 @@ def test_detect_rejects_out_of_range_coordinates(lat, lng):
     assert response.status_code == 422
 
 
+# --- authentication on the report routes -------------------------------------
+
+
+@pytest.mark.parametrize("method", ["get", "post"])
+def test_report_routes_reject_a_missing_token(method):
+    request = getattr(client, method)
+    if method == "post":
+        response = request("/reports", json=[{"report_id": "x"}])
+    else:
+        response = request("/reports")
+    assert response.status_code == 401
+    assert response.json()["detail"] == "missing bearer token"
+    assert response.headers["www-authenticate"] == "Bearer"
+
+
+@pytest.mark.parametrize("method", ["get", "post"])
+def test_report_routes_reject_a_wrong_token(method):
+    request = getattr(client, method)
+    headers = {"Authorization": "Bearer not-the-token"}
+    if method == "post":
+        response = request("/reports", json=[{"report_id": "x"}], headers=headers)
+    else:
+        response = request("/reports", headers=headers)
+    assert response.status_code == 401
+    assert response.json()["detail"] == "invalid token"
+
+
+@pytest.mark.parametrize(
+    "header",
+    ["", "Bearer", "Bearer ", "Basic test-token-123", "test-token-123"],
+)
+def test_report_routes_require_a_bearer_scheme(header):
+    response = client.get("/reports", headers={"Authorization": header})
+    assert response.status_code == 401
+
+
+@pytest.mark.parametrize("method", ["get", "post"])
+def test_report_routes_are_closed_when_no_token_is_configured(monkeypatch, method):
+    monkeypatch.delenv(SYNC_TOKEN_ENV, raising=False)
+    request = getattr(client, method)
+    if method == "post":
+        response = request("/reports", json=[{"report_id": "x"}], headers=AUTH)
+    else:
+        response = request("/reports", headers=AUTH)
+    assert response.status_code == 503
+    assert SYNC_TOKEN_ENV in response.json()["detail"]
+
+
+def test_token_is_not_required_for_detection_or_health():
+    assert client.get("/health").status_code == 200
+    assert client.get("/limits").status_code == 200
+    detected = client.post("/detect", files={"image": ("road.png", png_bytes(), "image/png")})
+    assert detected.status_code == 200
+
+
+# --- storage ----------------------------------------------------------------
+
+
 def test_reports_are_persisted_and_listed():
     reports = [
         {"report_id": "a", "synced": False, "notes": "pothole"},
         {"report_id": "b", "synced": False},
     ]
-    response = client.post("/reports", json=reports)
+    response = client.post("/reports", json=reports, headers=AUTH)
     assert response.status_code == 200
     assert response.json() == {
         "accepted": 2,
@@ -145,7 +208,7 @@ def test_reports_are_persisted_and_listed():
         "total_synced": 2,
     }
 
-    listing = client.get("/reports").json()
+    listing = client.get("/reports", headers=AUTH).json()
     assert listing["total_synced"] == 2
     assert {report["report_id"] for report in listing["reports"]} == {"a", "b"}
     assert all(report["synced"] is True for report in listing["reports"])
@@ -153,20 +216,20 @@ def test_reports_are_persisted_and_listed():
 
 def test_resending_a_report_is_idempotent():
     payload = [{"report_id": "retry-me"}]
-    assert client.post("/reports", json=payload).json()["stored"] == 1
+    assert client.post("/reports", json=payload, headers=AUTH).json()["stored"] == 1
 
-    second = client.post("/reports", json=payload).json()
+    second = client.post("/reports", json=payload, headers=AUTH).json()
     assert second == {"accepted": 1, "stored": 0, "skipped": 1, "total_synced": 1}
 
 
 def test_reports_require_a_report_id():
-    response = client.post("/reports", json=[{"notes": "anonymous"}])
+    response = client.post("/reports", json=[{"notes": "anonymous"}], headers=AUTH)
     assert response.status_code == 422
 
 
-def test_reports_reach_a_fresh_store(temp_store, tmp_path):
+def test_reports_reach_a_fresh_store(tmp_path):
     """A second process reading the same database still sees the reports."""
-    client.post("/reports", json=[{"report_id": "durable"}])
+    client.post("/reports", json=[{"report_id": "durable"}], headers=AUTH)
 
     other_instance = create_store(f"sqlite:///{tmp_path / 'reports.db'}")
     assert other_instance.count() == 1
@@ -174,15 +237,19 @@ def test_reports_reach_a_fresh_store(temp_store, tmp_path):
 
 
 def test_reports_listing_respects_the_limit():
-    client.post("/reports", json=[{"report_id": f"r{i}"} for i in range(5)])
-    listing = client.get("/reports", params={"limit": 2}).json()
+    client.post(
+        "/reports", json=[{"report_id": f"r{i}"} for i in range(5)], headers=AUTH
+    )
+    listing = client.get("/reports", params={"limit": 2}, headers=AUTH).json()
     assert len(listing["reports"]) == 2
     assert listing["total_synced"] == 5
 
 
 def test_reports_listing_validates_the_limit():
-    assert client.get("/reports", params={"limit": 0}).status_code == 422
-    assert client.get("/reports", params={"limit": 10_000}).status_code == 422
+    assert client.get("/reports", params={"limit": 0}, headers=AUTH).status_code == 422
+    assert (
+        client.get("/reports", params={"limit": 10_000}, headers=AUTH).status_code == 422
+    )
 
 
 def test_reports_return_503_when_storage_is_not_configured(monkeypatch):
@@ -193,7 +260,7 @@ def test_reports_return_503_when_storage_is_not_configured(monkeypatch):
     app.dependency_overrides.clear()  # exercise the real dependency
     get_store.cache_clear()
     try:
-        response = client.get("/reports")
+        response = client.get("/reports", headers=AUTH)
         assert response.status_code == 503
         assert "DATABASE_URL" in response.json()["detail"]
     finally:
