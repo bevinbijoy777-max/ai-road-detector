@@ -10,6 +10,7 @@ The Python OOP core in `python/` is the same domain model: detector, reports and
 | --- | --- |
 | `python/airoad` domain models, detectors, CLI, FastAPI sync API | Implemented, tested |
 | Tests + CI (`.github/workflows/python-tests.yml`) | Implemented, runs on push/PR |
+| Vercel deployment (`app.py` entrypoint, `.python-version`) | Configured, see [Deploying on Vercel](#deploying-on-vercel) |
 | Android app (`android/`) — screens, `OnDeviceDetector`, Room store, `ReportSyncWorker`, Maps view | **Not in this repository yet** |
 
 The Python half below is deployable today. The Android half is described under [Planned Android app](#planned-android-app) so the roadmap stays in one place.
@@ -111,8 +112,46 @@ uvicorn airoad.api:app --host 0.0.0.0 --port ${PORT:-8000}
 ```
 
 Installing the package (`pip install .`, or `pip install -e .` for development) makes
-`airoad` importable, so no `PYTHONPATH` is needed. Dependencies are read from
-`requirements.txt` via `pyproject.toml`, so there is one list to maintain.
+`airoad` importable, so no `PYTHONPATH` is needed. Dependencies are declared in both
+`pyproject.toml` and `requirements.txt` — keep the two lists in sync.
+
+## Deploying on Vercel
+
+`app.py` in the repository root is the Vercel entrypoint. Vercel's FastAPI preset looks
+for a module-level `app`, and the real application lives in `python/airoad/api.py`, so
+`app.py` puts that source root on `sys.path` and re-exports it. No `vercel.json`,
+rewrites or build command are needed.
+
+1. Push the repo to GitHub.
+2. In Vercel, choose **Add New → Project** and import the repository.
+3. Leave the detected framework preset as **FastAPI** and deploy.
+
+Or from the CLI:
+
+```bash
+npm i -g vercel
+vercel          # preview deployment
+vercel --prod   # production deployment
+```
+
+The first `vercel` run links the project to your account; there is nothing else to
+configure. Dependencies are installed from `requirements.txt` / `pyproject.toml`, and
+`.python-version` pins the runtime to Python 3.12.
+
+### Vercel limits that affect this API
+
+| Limit | Effect |
+| --- | --- |
+| 4.5 MB request body | `POST /detect` returns **413** above this. Downscale photos on the device before uploading. |
+| 500 MB uncompressed function bundle (Python) | Plenty for numpy + Pillow. |
+| 300 s max duration on Hobby | Detection resizes to 224 px and finishes in well under a second. |
+
+`POST /reports` keeps its acknowledgement count in process memory. On Vercel each
+instance has its own memory and instances are recycled, so the count resets and is not
+shared between instances — treat the endpoint as a transport for the upload, not as
+durable storage. Point it at a database before relying on it.
+
+`GET /health` is a cheap way to confirm a fresh deployment is serving.
 
 ## OOP layout
 
