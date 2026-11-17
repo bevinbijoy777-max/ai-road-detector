@@ -32,6 +32,7 @@ from fastapi import (
     Request,
     UploadFile,
 )
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 
 from airoad.auth import require_driver
@@ -122,6 +123,12 @@ def _resolve_location(
             status_code=422, detail="latitude must be -90..90 and longitude -180..180"
         )
     return location
+
+
+@app.get("/", include_in_schema=False)
+def root() -> RedirectResponse:
+    """Send anyone who opens the base URL to the interactive docs."""
+    return RedirectResponse(url="/docs", status_code=307)
 
 
 @app.get("/health")

@@ -55,6 +55,13 @@ def detect(headers=None):
 # --- public endpoints -------------------------------------------------------
 
 
+def test_root_redirects_to_the_interactive_docs():
+    response = client.get("/", follow_redirects=False)
+
+    assert response.status_code == 307
+    assert response.headers["location"] == "/docs"
+
+
 def test_health_reports_the_offline_model_and_storage(monkeypatch):
     monkeypatch.delenv("DATABASE_URL", raising=False)
     response = client.get("/health")
